@@ -244,7 +244,12 @@ def _convert_depth(out, inp, row_num, ss_bid, ss_ask, snapshot_mode):
     for rn in range(len(inp)):
         row = inp[rn]
 
-        # ALL FIXES HERE: use dictionary-style access ['field'] instead of .field
+        # Use dictionary-style access ['field'] instead of .field throughout —
+        # numba 0.65+ returns raw numpy.void scalars for structured array
+        # element access; dot-access on those segfaults inside @njit when
+        # mid-day snapshot reads ss_bid[0].field / ss_ask[0].field. Extends
+        # the partial fix from upstream PR #288 which only covered `row`
+        # reads. See nkaz001/hftbacktest#306 / #288.
         if row['is_snapshot'] == 1:
             if (
                 (snapshot_mode == SNAPSHOT_MODE_IGNORE)
@@ -256,24 +261,24 @@ def _convert_depth(out, inp, row_num, ss_bid, ss_ask, snapshot_mode):
                 ss_bid_rn = 0
                 ss_ask_rn = 0
             if row['side'] == 1:
-                ss_bid[ss_bid_rn].ev = DEPTH_SNAPSHOT_EVENT | BUY_EVENT
-                ss_bid[ss_bid_rn].exch_ts = row['exch_ts']
-                ss_bid[ss_bid_rn].local_ts = row['local_ts']
-                ss_bid[ss_bid_rn].px = row['px']
-                ss_bid[ss_bid_rn].qty = row['qty']
-                ss_bid[ss_bid_rn].order_id = 0
-                ss_bid[ss_bid_rn].ival = 0
-                ss_bid[ss_bid_rn].fval = 0
+                ss_bid[ss_bid_rn]['ev'] = DEPTH_SNAPSHOT_EVENT | BUY_EVENT
+                ss_bid[ss_bid_rn]['exch_ts'] = row['exch_ts']
+                ss_bid[ss_bid_rn]['local_ts'] = row['local_ts']
+                ss_bid[ss_bid_rn]['px'] = row['px']
+                ss_bid[ss_bid_rn]['qty'] = row['qty']
+                ss_bid[ss_bid_rn]['order_id'] = 0
+                ss_bid[ss_bid_rn]['ival'] = 0
+                ss_bid[ss_bid_rn]['fval'] = 0
                 ss_bid_rn += 1
             else:
-                ss_ask[ss_ask_rn].ev = DEPTH_SNAPSHOT_EVENT | SELL_EVENT
-                ss_ask[ss_ask_rn].exch_ts = row['exch_ts']
-                ss_ask[ss_ask_rn].local_ts = row['local_ts']
-                ss_ask[ss_ask_rn].px = row['px']
-                ss_ask[ss_ask_rn].qty = row['qty']
-                ss_ask[ss_ask_rn].order_id = 0
-                ss_ask[ss_ask_rn].ival = 0
-                ss_ask[ss_ask_rn].fval = 0
+                ss_ask[ss_ask_rn]['ev'] = DEPTH_SNAPSHOT_EVENT | SELL_EVENT
+                ss_ask[ss_ask_rn]['exch_ts'] = row['exch_ts']
+                ss_ask[ss_ask_rn]['local_ts'] = row['local_ts']
+                ss_ask[ss_ask_rn]['px'] = row['px']
+                ss_ask[ss_ask_rn]['qty'] = row['qty']
+                ss_ask[ss_ask_rn]['order_id'] = 0
+                ss_ask[ss_ask_rn]['ival'] = 0
+                ss_ask[ss_ask_rn]['fval'] = 0
                 ss_ask_rn += 1
         else:
             is_sod_snapshot = False
@@ -282,14 +287,14 @@ def _convert_depth(out, inp, row_num, ss_bid, ss_ask, snapshot_mode):
 
                 ss_bid = ss_bid[:ss_bid_rn]
                 if len(ss_bid) > 0:
-                    out[row_num].ev = DEPTH_CLEAR_EVENT | BUY_EVENT
-                    out[row_num].exch_ts = ss_bid[0].exch_ts
-                    out[row_num].local_ts = ss_bid[0].local_ts
-                    out[row_num].px = ss_bid[-1].px
-                    out[row_num].qty = 0
-                    out[row_num].order_id = 0
-                    out[row_num].ival = 0
-                    out[row_num].fval = 0
+                    out[row_num]['ev'] = DEPTH_CLEAR_EVENT | BUY_EVENT
+                    out[row_num]['exch_ts'] = ss_bid[0]['exch_ts']
+                    out[row_num]['local_ts'] = ss_bid[0]['local_ts']
+                    out[row_num]['px'] = ss_bid[-1]['px']
+                    out[row_num]['qty'] = 0
+                    out[row_num]['order_id'] = 0
+                    out[row_num]['ival'] = 0
+                    out[row_num]['fval'] = 0
                     row_num += 1
                     out[row_num:row_num + len(ss_bid)] = ss_bid[:]
                     row_num += len(ss_bid)
@@ -297,28 +302,28 @@ def _convert_depth(out, inp, row_num, ss_bid, ss_ask, snapshot_mode):
 
                 ss_ask = ss_ask[:ss_ask_rn]
                 if len(ss_ask) > 0:
-                    out[row_num].ev = DEPTH_CLEAR_EVENT | SELL_EVENT
-                    out[row_num].exch_ts = ss_ask[0].exch_ts
-                    out[row_num].local_ts = ss_ask[0].local_ts
-                    out[row_num].px = ss_ask[-1].px
-                    out[row_num].qty = 0
-                    out[row_num].order_id = 0
-                    out[row_num].ival = 0
-                    out[row_num].fval = 0
+                    out[row_num]['ev'] = DEPTH_CLEAR_EVENT | SELL_EVENT
+                    out[row_num]['exch_ts'] = ss_ask[0]['exch_ts']
+                    out[row_num]['local_ts'] = ss_ask[0]['local_ts']
+                    out[row_num]['px'] = ss_ask[-1]['px']
+                    out[row_num]['qty'] = 0
+                    out[row_num]['order_id'] = 0
+                    out[row_num]['ival'] = 0
+                    out[row_num]['fval'] = 0
                     row_num += 1
                     out[row_num:row_num + len(ss_ask)] = ss_ask[:]
                     row_num += len(ss_ask)
                 ss_ask_rn = 0
 
             # Regular depth update
-            out[row_num].ev = DEPTH_EVENT | (BUY_EVENT if row['side'] == 1 else SELL_EVENT)
-            out[row_num].exch_ts = row['exch_ts']
-            out[row_num].local_ts = row['local_ts']
-            out[row_num].px = row['px']
-            out[row_num].qty = row['qty']
-            out[row_num].order_id = 0
-            out[row_num].ival = 0
-            out[row_num].fval = 0
+            out[row_num]['ev'] = DEPTH_EVENT | (BUY_EVENT if row['side'] == 1 else SELL_EVENT)
+            out[row_num]['exch_ts'] = row['exch_ts']
+            out[row_num]['local_ts'] = row['local_ts']
+            out[row_num]['px'] = row['px']
+            out[row_num]['qty'] = row['qty']
+            out[row_num]['order_id'] = 0
+            out[row_num]['ival'] = 0
+            out[row_num]['fval'] = 0
             row_num += 1
     return row_num
 
