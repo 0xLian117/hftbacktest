@@ -99,11 +99,13 @@ where
             }
 
             // Processes receiving order response.
-            // upstream #316: PartiallyFilled responses must ALSO be applied — the
-            // exchange respond()s once per chunk with the per-event exec_qty, so
-            // crediting both PartiallyFilled and Filled sums to the correct total.
-            // (Applying only Filled credited just the final chunk → undercount.)
-            if order.status == Status::Filled || order.status == Status::PartiallyFilled {
+            // NOTE: upstream #316 (partial fills not booked to local position/balance)
+            // is NOT fixed by simply adding PartiallyFilled here — tried it, closure
+            // still diverged (+5.97), because the per-fill accounting interacts with
+            // how exec_qty is reported (per-event vs cumulative) on both the engine
+            // AND our strategy's emit loop. Until that's worked out properly, use
+            // exchange_model: no_partial_fill (closure = 0, verified). See #316.
+            if order.status == Status::Filled {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.
