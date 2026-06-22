@@ -99,7 +99,11 @@ where
             }
 
             // Processes receiving order response.
-            if order.status == Status::Filled {
+            // upstream #316: PartiallyFilled responses must ALSO be applied — the
+            // exchange respond()s once per chunk with the per-event exec_qty, so
+            // crediting both PartiallyFilled and Filled sums to the correct total.
+            // (Applying only Filled credited just the final chunk → undercount.)
+            if order.status == Status::Filled || order.status == Status::PartiallyFilled {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.
