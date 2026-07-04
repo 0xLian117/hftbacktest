@@ -109,10 +109,11 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    // One session tag per process start — files are <sym>_<date>_<session>.gz, so a
+    // One session tag per process start (millisecond precision so a same-second
+    // restart can't reuse a filename) — files are <sym>_<date>_<session>.gz, so a
     // restart writes fresh files and never appends to a possibly-truncated file
     // from a prior hard crash.
-    let session = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let session = Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
     let mut writer = Writer::new(&args.path, &session);
     loop {
         select! {
