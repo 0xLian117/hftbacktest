@@ -18,9 +18,12 @@ pub struct RotatingFile {
 impl RotatingFile {
     fn create(datetime: DateTime<Utc>, path: &str) -> Result<GzEncoder<File>, io::Error> {
         let date = datetime.date_naive().format("%Y%m%d");
+        // append (not truncate/overwrite): a systemd restart must not clobber the
+        // day's already-recorded data. Appending starts a new gzip member; readers
+        // (Python gzip, zcat) decode concatenated members transparently.
         let file = File::options()
             .create(true)
-            .write(true)
+            .append(true)
             .open(format!("{path}_{date}.gz"))?;
         Ok(GzEncoder::new(file, Compression::default()))
     }

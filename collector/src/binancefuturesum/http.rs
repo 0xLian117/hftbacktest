@@ -189,7 +189,14 @@ pub async fn keep_connection(
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         } else {
-            break;
+            // connect() returned Ok = the stream ended cleanly (server closed
+            // without a Close frame). run_collection consumes for the whole
+            // process lifetime, so reconnect instead of letting this routed
+            // stream (e.g. /market trades) silently disappear while the other
+            // connection keeps the process alive. On shutdown the runtime
+            // cancels this task at the await; the delay avoids a tight loop.
+            warn!("websocket closed cleanly, reconnecting");
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
