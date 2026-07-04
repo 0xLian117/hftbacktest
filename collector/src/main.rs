@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use chrono::Utc;
 use clap::Parser;
 use tokio::{self, select, signal, sync::mpsc::unbounded_channel};
 use tracing::{error, info};
@@ -108,7 +109,11 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let mut writer = Writer::new(&args.path);
+    // One session tag per process start — files are <sym>_<date>_<session>.gz, so a
+    // restart writes fresh files and never appends to a possibly-truncated file
+    // from a prior hard crash.
+    let session = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let mut writer = Writer::new(&args.path, &session);
     loop {
         select! {
             _ = signal::ctrl_c() => {
