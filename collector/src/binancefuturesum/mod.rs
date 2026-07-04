@@ -3,7 +3,7 @@ mod http;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-pub use http::{fetch_depth_snapshot, keep_connection};
+pub use http::{WS_MARKET, WS_PUBLIC, classify_stream, fetch_depth_snapshot, keep_connection};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::{error, warn};
@@ -83,7 +83,36 @@ pub async fn run_collection(
 ) -> Result<(), anyhow::Error> {
     let mut prev_u_map = HashMap::new();
     let (ws_tx, mut ws_rx) = unbounded_channel();
-    let h = tokio::spawn(keep_connection(streams, symbols, ws_tx.clone()));
+
+    // QUI-72: Binance UM routes bookTicker/depth to /public and trade/… to
+    // /market; the unrouted endpoint silently drops trades. Split streams by
+    // endpoint, run one connection each, both feeding the same channel.
+    let mut public_streams = Vec::new();
+    let mut market_streams = Vec::new();
+    for s in &streams {
+        if classify_stream(s) == "market" {
+            market_streams.push(s.clone());
+        } else {
+            public_streams.push(s.clone());
+        }
+    }
+    let mut handles = Vec::new();
+    if !public_streams.is_empty() {
+        handles.push(tokio::spawn(keep_connection(
+            WS_PUBLIC,
+            public_streams,
+            symbols.clone(),
+            ws_tx.clone(),
+        )));
+    }
+    if !market_streams.is_empty() {
+        handles.push(tokio::spawn(keep_connection(
+            WS_MARKET,
+            market_streams,
+            symbols.clone(),
+            ws_tx.clone(),
+        )));
+    }
     // https://www.binance.com/en/support/faq/rate-limits-on-binance-futures-281596e222414cdd9051664ea621cdc3
     // The default rate limit per IP is 2,400/min and the weight is 20 at a depth of 1000.
     // The maximum request rate for fetching snapshots is 120 per minute.
@@ -94,6 +123,8 @@ pub async fn run_collection(
             error!(?error, "couldn't handle the received data.");
         }
     }
-    let _ = h.await;
+    for h in handles {
+        let _ = h.await;
+    }
     Ok(())
 }
