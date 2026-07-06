@@ -125,29 +125,11 @@ pub async fn connect(
     Ok(())
 }
 
-/// Binance USDT-M routes market-data streams across two endpoints:
-/// bookTicker/depth on `/public`, trade/aggTrade/markPrice/forceOrder on
-/// `/market`. The unrouted `/stream?streams=` endpoint only delivers `/public`
-/// streams, so trades are SILENTLY dropped there. Route each stream by type.
-pub const WS_PUBLIC: &str = "wss://fstream.binance.com/public";
-pub const WS_MARKET: &str = "wss://fstream.binance.com/market";
-
-pub fn classify_stream(stream: &str) -> &'static str {
-    // `stream` is a template like "$symbol@trade" or "$symbol@depth@0ms";
-    // classify by the type after the first '@'.
-    let ty = stream.split_once('@').map_or(stream, |(_, t)| t);
-    if ty.starts_with("depth") {
-        "public"
-    } else if matches!(ty, "trade" | "aggTrade" | "markPrice" | "markPrice@1s" | "forceOrder") {
-        "market"
-    } else {
-        // bookTicker, miniTicker, ticker, … default to public
-        "public"
-    }
-}
-
+// Binance USDT-M: @trade, @bookTicker and @depth@0ms are all served on the
+// unrouted /stream?streams= endpoint (verified 2026-07-06). NOTE: @aggTrade
+// (NOT used here) is the one that only comes on /market — do not confuse the
+// two. So a single unrouted connection carries every stream this collector uses.
 pub async fn keep_connection(
-    base_url: &'static str,
     streams: Vec<String>,
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
@@ -171,7 +153,7 @@ pub async fn keep_connection(
             .collect::<Vec<_>>()
             .join("/");
         if let Err(error) = connect(
-            &format!("{base_url}/stream?streams={streams_str}"),
+            &format!("wss://fstream.binance.com/stream?streams={streams_str}"),
             ws_tx.clone(),
         )
         .await
@@ -191,30 +173,11 @@ pub async fn keep_connection(
         } else {
             // connect() returned Ok = the stream ended cleanly (server closed
             // without a Close frame). run_collection consumes for the whole
-            // process lifetime, so reconnect instead of letting this routed
-            // stream (e.g. /market trades) silently disappear while the other
-            // connection keeps the process alive. On shutdown the runtime
-            // cancels this task at the await; the delay avoids a tight loop.
+            // process lifetime, so reconnect instead of ending the feed; on
+            // shutdown the runtime cancels this task at the await. The delay
+            // avoids a tight loop.
             warn!("websocket closed cleanly, reconnecting");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::classify_stream;
-
-    #[test]
-    fn routes_um_streams_to_endpoints() {
-        // trades + mark price + liquidations -> /market
-        assert_eq!(classify_stream("$symbol@trade"), "market");
-        assert_eq!(classify_stream("$symbol@aggTrade"), "market");
-        assert_eq!(classify_stream("$symbol@markPrice@1s"), "market");
-        assert_eq!(classify_stream("$symbol@forceOrder"), "market");
-        // book + depth -> /public
-        assert_eq!(classify_stream("$symbol@bookTicker"), "public");
-        assert_eq!(classify_stream("$symbol@depth@0ms"), "public");
-        assert_eq!(classify_stream("$symbol@depth"), "public");
     }
 }
