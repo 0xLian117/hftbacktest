@@ -16,7 +16,9 @@ use crate::{
         BuildError,
         ElapseResult,
         Event,
+        LOCAL_ASK_DEPTH_CLEAR_EVENT,
         LOCAL_ASK_DEPTH_EVENT,
+        LOCAL_BID_DEPTH_CLEAR_EVENT,
         LOCAL_BID_DEPTH_EVENT,
         LOCAL_BUY_TRADE_EVENT,
         LOCAL_SELL_TRADE_EVENT,
@@ -212,7 +214,14 @@ where
             LiveEvent::Feed { event, .. } => {
                 let instrument = unsafe { self.instruments.get_unchecked_mut(inst_no) };
                 instrument.last_feed_latency = Some((event.exch_ts, event.local_ts));
-                if event.is(LOCAL_BID_DEPTH_EVENT) {
+                if event.is(LOCAL_BID_DEPTH_CLEAR_EVENT) {
+                    // Emitted by the connector ahead of a depth snapshot so that
+                    // levels zeroed while the feed was down don't linger as stale
+                    // book state. A non-finite px clears the whole side.
+                    instrument.depth.clear_depth(Side::Buy, event.px);
+                } else if event.is(LOCAL_ASK_DEPTH_CLEAR_EVENT) {
+                    instrument.depth.clear_depth(Side::Sell, event.px);
+                } else if event.is(LOCAL_BID_DEPTH_EVENT) {
                     instrument
                         .depth
                         .update_bid_depth(event.px, event.qty, event.exch_ts);

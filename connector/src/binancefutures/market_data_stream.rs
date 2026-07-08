@@ -197,6 +197,30 @@ impl MarketDataStream {
             Ok((bids, asks)) => {
                 self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
 
+                // Clear both sides before applying the snapshot: the snapshot only
+                // carries non-zero levels, so levels zeroed while the feed was down
+                // (reconnect) would otherwise linger as stale book state in bots.
+                // A non-finite px means "clear the whole side" (L2MarketDepth).
+                // NOTE: snapshot path only — the steady-state diff path must NOT
+                // clear (diffs are incremental).
+                for clear_ev in [LOCAL_BID_DEPTH_CLEAR_EVENT, LOCAL_ASK_DEPTH_CLEAR_EVENT] {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: symbol.clone(),
+                            event: Event {
+                                ev: clear_ev,
+                                exch_ts: data.transaction_time * 1_000_000,
+                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                                order_id: 0,
+                                px: f64::NAN,
+                                qty: 0.0,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
+                }
+
                 for (px, qty) in bids {
                     self.ev_tx
                         .send(PublishEvent::LiveEvent(LiveEvent::Feed {
