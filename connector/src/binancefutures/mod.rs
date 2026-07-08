@@ -112,6 +112,7 @@ impl BinanceFutures {
         let base_url = self.config.stream_url.clone();
         let client = self.client.clone();
         let symbol_tx = self.symbol_tx.clone();
+        let symbols = self.symbols.clone();
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
@@ -133,6 +134,7 @@ impl BinanceFutures {
                         client.clone(),
                         ev_tx.clone(),
                         symbol_tx.subscribe(),
+                        symbols.clone(),
                     );
                     debug!("Connecting to the market data stream...");
                     stream.connect(&base_url).await?;

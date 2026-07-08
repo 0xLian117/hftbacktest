@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -38,6 +39,11 @@ pub struct MarketDataStream {
     client: BinanceFuturesClient,
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
+    // Symbols already registered with the connector. On (re)connect, all of them
+    // are re-subscribed: the broadcast receiver obtained for a fresh connection
+    // only delivers registrations sent after it subscribed, so without this the
+    // market data stream stays silent after a reconnect.
+    symbols: Arc<Mutex<HashSet<String>>>,
     pending_depth_messages: HashMap<String, Vec<stream::Depth>>,
     prev_u: HashMap<String, i64>,
     rest_tx: UnboundedSender<(String, rest::Depth)>,
@@ -49,12 +55,14 @@ impl MarketDataStream {
         client: BinanceFuturesClient,
         ev_tx: UnboundedSender<PublishEvent>,
         symbol_rx: Receiver<String>,
+        symbols: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         let (rest_tx, rest_rx) = unbounded_channel::<(String, rest::Depth)>();
         Self {
             client,
             ev_tx,
             symbol_rx,
+            symbols,
             pending_depth_messages: Default::default(),
             prev_u: Default::default(),
             rest_tx,
@@ -268,6 +276,29 @@ impl MarketDataStream {
         let (mut write, mut read) = ws_stream.split();
         let mut ping_checker = time::interval(Duration::from_secs(10));
         let mut last_ping = Instant::now();
+
+        // Re-subscribe every already-registered symbol on (re)connect. A fresh
+        // depth snapshot per symbol is fetched automatically since `prev_u` is
+        // empty for a new MarketDataStream. Duplicate SUBSCRIBE on the initial
+        // connection (set + broadcast race) is harmless/idempotent on Binance.
+        let registered: Vec<String> = self
+            .symbols
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        for symbol in registered {
+            let id = generate_rand_string(16);
+            write.send(Message::Text(format!(r#"{{
+                "method": "SUBSCRIBE",
+                "params": [
+                    "{symbol}@trade",
+                    "{symbol}@depth@0ms"
+                ],
+                "id": "{id}"
+            }}"#).into())).await?;
+        }
 
         loop {
             select! {
