@@ -44,7 +44,9 @@ pub struct MarketDataStream {
     // only delivers registrations sent after it subscribed, so without this the
     // market data stream stays silent after a reconnect.
     symbols: Arc<Mutex<HashSet<String>>>,
-    pending_depth_messages: HashMap<String, Vec<stream::Depth>>,
+    // (QUI-77) 原 `pending_depth_messages: HashMap<String, Vec<stream::Depth>>`
+    // 已移除——借用式 Depth<'a> 无法跨消息边界缓存进结构体字段，且该字段本就
+    // 全死（声明+init，所有实际使用都注释着的未完成 snapshot 对齐 WIP）。
     prev_u: HashMap<String, i64>,
     rest_tx: UnboundedSender<(String, rest::Depth)>,
     rest_rx: UnboundedReceiver<(String, rest::Depth)>,
@@ -63,7 +65,6 @@ impl MarketDataStream {
             ev_tx,
             symbol_rx,
             symbols,
-            pending_depth_messages: Default::default(),
             prev_u: Default::default(),
             rest_tx,
             rest_rx,

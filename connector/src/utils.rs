@@ -153,9 +153,11 @@ pub fn get_timestamp() -> u64 {
 
 pub type PxQty = (f64, f64);
 
-pub fn parse_depth(
-    bids: Vec<(String, String)>,
-    asks: Vec<(String, String)>,
+// 泛型 S: AsRef<str>——String（bybit/binancespot 拥有式）与 &str（binancefutures
+// 借用式零拷贝 Depth，QUI-77）都可传入，各 connector 调用点零改动。
+pub fn parse_depth<S: AsRef<str>>(
+    bids: Vec<(S, S)>,
+    asks: Vec<(S, S)>,
 ) -> Result<(Vec<PxQty>, Vec<PxQty>), BybitError> {
     let mut bids_ = Vec::with_capacity(bids.len());
     for (px, qty) in bids {
@@ -168,8 +170,8 @@ pub fn parse_depth(
     Ok((bids_, asks_))
 }
 
-pub fn parse_px_qty_tup(px: String, qty: String) -> Result<PxQty, BybitError> {
-    Ok((px.parse()?, qty.parse()?))
+pub fn parse_px_qty_tup<S: AsRef<str>>(px: S, qty: S) -> Result<PxQty, BybitError> {
+    Ok((px.as_ref().parse()?, qty.as_ref().parse()?))
 }
 
 pub trait BackoffStrategy {
