@@ -38,6 +38,33 @@ pub enum EventStream<'a> {
     AccountUpdate(AccountUpdate),
     #[serde(rename = "listenKeyExpired")]
     ListenKeyExpired(ListenKeyStream),
+    // QUI-86：bookTicker（BBO 事件触发流，博主处方 fair 用它非 depth top）。热路径 → 借用式。
+    #[serde(rename = "bookTicker")]
+    BookTicker(BookTicker<'a>),
+}
+
+// QUI-86 bookTicker JSON：{u,s,b,B,a,A,T,E}。价/量借用式（Binance 数字串不含转义），
+// symbol owned（to_lowercase 必分配，同 Depth）。
+#[derive(Deserialize, Debug)]
+pub struct BookTicker<'a> {
+    #[serde(rename = "u")]
+    pub update_id: i64,
+    #[serde(rename = "s")]
+    #[serde(deserialize_with = "to_lowercase")]
+    pub symbol: String,
+    #[serde(rename = "b")]
+    #[serde(borrow)]
+    pub best_bid: &'a str,
+    #[serde(rename = "B")]
+    pub best_bid_qty: &'a str,
+    #[serde(rename = "a")]
+    pub best_ask: &'a str,
+    #[serde(rename = "A")]
+    pub best_ask_qty: &'a str,
+    #[serde(rename = "T")]
+    pub transaction_time: i64,
+    #[serde(rename = "E")]
+    pub event_time: i64,
 }
 
 #[derive(Deserialize, Debug)]

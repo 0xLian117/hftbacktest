@@ -23,6 +23,10 @@ pub struct Instrument<MD> {
     orders: HashMap<OrderId, Order>,
     last_feed_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
+    // QUI-86：bookTicker BBO 独立存储（bid, bid_qty, ask, ask_qty），不进 depth 的 L2
+    // （bookTicker 只给顶档，并进 L2 会造幽灵档，QUI-79 教训）。best_bid()/best_ask()
+    // 仍走 L2 推导、零回归；策略要 freshest BBO 时读这个。
+    last_bbo: Option<(f64, f64, f64, f64)>,
     state: StateValues,
 }
 
@@ -52,6 +56,7 @@ impl<MD> Instrument<MD> {
             orders: Default::default(),
             last_feed_latency: None,
             last_order_latency: None,
+            last_bbo: None,
             state: Default::default(),
         }
     }

@@ -189,6 +189,38 @@ impl MarketDataStream {
                     error!(error = ?e, "Couldn't parse trade stream.");
                 }
             },
+            // QUI-86：bookTicker → 两条 BBO Feed 事件（bot 存进 Instrument.last_bbo，不进 L2）。
+            // 不 batch：BBO 是独立顶档更新、无 L2 批次语义。不做 u 去重（覆盖写，见 QUI-86 plan）。
+            EventStream::BookTicker(data) => {
+                let ts = data.transaction_time * 1_000_000;
+                let now = Utc::now().timestamp_nanos_opt().unwrap();
+                let sides = [
+                    (LOCAL_BID_DEPTH_BBO_EVENT, data.best_bid, data.best_bid_qty),
+                    (LOCAL_ASK_DEPTH_BBO_EVENT, data.best_ask, data.best_ask_qty),
+                ];
+                for (ev_kind, px_s, qty_s) in sides {
+                    match parse_px_qty_tup(px_s, qty_s) {
+                        Ok((px, qty)) => {
+                            self.ev_tx
+                                .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                                    symbol: data.symbol.clone(),
+                                    event: Event {
+                                        ev: ev_kind,
+                                        exch_ts: ts,
+                                        local_ts: now,
+                                        order_id: 0,
+                                        px,
+                                        qty,
+                                        ival: 0,
+                                        fval: 0.0,
+                                    },
+                                }))
+                                .unwrap();
+                        }
+                        Err(e) => error!(error = ?e, "Couldn't parse bookTicker px/qty."),
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -319,7 +351,8 @@ impl MarketDataStream {
                 "method": "SUBSCRIBE",
                 "params": [
                     "{symbol}@trade",
-                    "{symbol}@depth@0ms"
+                    "{symbol}@depth@0ms",
+                    "{symbol}@bookTicker"
                 ],
                 "id": "{id}"
             }}"#).into())).await?;
@@ -343,7 +376,8 @@ impl MarketDataStream {
                             "method": "SUBSCRIBE",
                             "params": [
                                 "{symbol}@trade",
-                                "{symbol}@depth@0ms"
+                                "{symbol}@depth@0ms",
+                                "{symbol}@bookTicker"
                             ],
                             "id": "{id}"
                         }}"#).into())).await?;

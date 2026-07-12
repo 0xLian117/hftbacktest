@@ -1,3 +1,8 @@
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
 use chrono::Utc;
 use hftbacktest::types::{OrdType, Side, TimeInForce};
 use serde::Deserialize;
@@ -14,12 +19,52 @@ use crate::{
     utils::sign_hmac_sha256,
 };
 
+// QUI-87 客户端限速：博主处方 token bucket（PRACTICES §3.2），vendor 原本裸打 REST。
+// 保守 request-rate 兜底（20/s、burst 40，远松于 Binance UM ~40/s IP 权重，不误伤
+// dust probe/soak 的正常序列）；per-endpoint 精细 weight + config 化留策略 cadence 清楚后。
+const RL_RATE_PER_S: f64 = 20.0;
+const RL_BURST: f64 = 40.0;
+
+struct TokenBucket {
+    rate: f64,
+    capacity: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: f64, capacity: f64) -> Self {
+        Self { rate, capacity, tokens: capacity, last: Instant::now() }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let dt = now.duration_since(self.last).as_secs_f64();
+        if dt > 0.0 {
+            self.tokens = (self.tokens + dt * self.rate).min(self.capacity);
+            self.last = now;
+        }
+    }
+
+    /// 取 1 token；成功返回 None，否则返回还需等待的时长（供调用方 sleep 后重试）。
+    fn take(&mut self, now: Instant) -> Option<Duration> {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            None
+        } else {
+            Some(Duration::from_secs_f64((1.0 - self.tokens) / self.rate))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BinanceFuturesClient {
     client: reqwest::Client,
     url: String,
     api_key: String,
     secret: String,
+    // Arc 共享：client 的所有 clone 共用一个桶 = 每 client 一份速率预算（正确）。
+    bucket: Arc<Mutex<TokenBucket>>,
 }
 
 impl BinanceFuturesClient {
@@ -29,6 +74,18 @@ impl BinanceFuturesClient {
             url: url.to_string(),
             api_key: api_key.to_string(),
             secret: secret.to_string(),
+            bucket: Arc::new(Mutex::new(TokenBucket::new(RL_RATE_PER_S, RL_BURST))),
+        }
+    }
+
+    /// 限速闸：取一个 token，取不到就 sleep 到有（锁只在 take 时持有、不跨 await）。
+    async fn rate_gate(&self) {
+        loop {
+            let wait = self.bucket.lock().unwrap().take(Instant::now());
+            match wait {
+                None => return,
+                Some(d) => tokio::time::sleep(d).await,
+            }
         }
     }
 
@@ -37,6 +94,7 @@ impl BinanceFuturesClient {
         path: &str,
         query: String,
     ) -> Result<T, reqwest::Error> {
+        self.rate_gate().await;
         let resp = self
             .client
             .get(format!("{}{}?{}", self.url, path, query))
@@ -53,6 +111,7 @@ impl BinanceFuturesClient {
         path: &str,
         mut query: String,
     ) -> Result<T, reqwest::Error> {
+        self.rate_gate().await;
         let time = Utc::now().timestamp_millis() - 1000;
         if !query.is_empty() {
             query.push('&');
@@ -80,6 +139,7 @@ impl BinanceFuturesClient {
         path: &str,
         body: String,
     ) -> Result<T, reqwest::Error> {
+        self.rate_gate().await;
         let time = Utc::now().timestamp_millis() - 1000;
         let sign_body = format!("recvWindow=5000&timestamp={time}{body}");
         let signature = sign_hmac_sha256(&self.secret, &sign_body);
@@ -104,6 +164,7 @@ impl BinanceFuturesClient {
         path: &str,
         body: String,
     ) -> Result<T, reqwest::Error> {
+        self.rate_gate().await;
         let time = Utc::now().timestamp_millis() - 1000;
         let sign_body = format!("recvWindow=5000&timestamp={time}{body}");
         let signature = sign_hmac_sha256(&self.secret, &sign_body);
@@ -128,6 +189,7 @@ impl BinanceFuturesClient {
         path: &str,
         body: String,
     ) -> Result<T, reqwest::Error> {
+        self.rate_gate().await;
         let time = Utc::now().timestamp_millis() - 1000;
         let sign_body = format!("recvWindow=5000&timestamp={time}{body}");
         let signature = sign_hmac_sha256(&self.secret, &sign_body);
@@ -345,5 +407,39 @@ impl BinanceFuturesClient {
             .get_noauth("/fapi/v1/depth", format!("symbol={symbol}&limit=1000"))
             .await?;
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // QUI-87：TokenBucket take(now) 确定性测（now 是参数，无 wall-clock flakiness）。
+    #[test]
+    fn token_bucket_drains_and_refills() {
+        let t0 = Instant::now();
+        let mut tb = TokenBucket::new(10.0, 2.0); // 10/s, burst 2
+        // last 初始化为 new() 内的 Instant::now()≈t0；用 t0 取两次 → 都成功（满桶 2）
+        assert!(tb.take(t0).is_none());
+        assert!(tb.take(t0).is_none());
+        // 第三次空桶 → 返回等待时长（≈1 token / 10/s = 0.1s 量级）
+        let w = tb.take(t0).expect("empty bucket should return wait");
+        assert!(w.as_secs_f64() > 0.0 && w.as_secs_f64() <= 0.11, "wait={w:?}");
+        // 前进 0.2s → 补 2 token（0.2*10），再取两次成功
+        let t1 = t0 + Duration::from_millis(200);
+        assert!(tb.take(t1).is_none());
+        assert!(tb.take(t1).is_none());
+        assert!(tb.take(t1).is_some()); // 又空
+    }
+
+    #[test]
+    fn token_bucket_caps_at_capacity() {
+        let t0 = Instant::now();
+        let mut tb = TokenBucket::new(10.0, 2.0);
+        // 前进很久也不超过 capacity=2 → 只能连取 2 次
+        let t1 = t0 + Duration::from_secs(100);
+        assert!(tb.take(t1).is_none());
+        assert!(tb.take(t1).is_none());
+        assert!(tb.take(t1).is_some());
     }
 }

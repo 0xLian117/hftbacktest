@@ -16,8 +16,10 @@ use crate::{
         BuildError,
         ElapseResult,
         Event,
+        LOCAL_ASK_DEPTH_BBO_EVENT,
         LOCAL_ASK_DEPTH_CLEAR_EVENT,
         LOCAL_ASK_DEPTH_EVENT,
+        LOCAL_BID_DEPTH_BBO_EVENT,
         LOCAL_BID_DEPTH_CLEAR_EVENT,
         LOCAL_BID_DEPTH_EVENT,
         LOCAL_BUY_TRADE_EVENT,
@@ -221,6 +223,14 @@ where
                     instrument.depth.clear_depth(Side::Buy, event.px);
                 } else if event.is(LOCAL_ASK_DEPTH_CLEAR_EVENT) {
                     instrument.depth.clear_depth(Side::Sell, event.px);
+                } else if event.is(LOCAL_BID_DEPTH_BBO_EVENT) {
+                    // QUI-86：bookTicker BBO 存进 Instrument.last_bbo（不进 L2，防幽灵档，QUI-79）。
+                    // 单侧事件 read-modify-write 保另一侧。best_bid()/best_ask() 不受影响、零回归。
+                    let (_, _, ask, askq) = instrument.last_bbo.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    instrument.last_bbo = Some((event.px, event.qty, ask, askq));
+                } else if event.is(LOCAL_ASK_DEPTH_BBO_EVENT) {
+                    let (bid, bidq, _, _) = instrument.last_bbo.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    instrument.last_bbo = Some((bid, bidq, event.px, event.qty));
                 } else if event.is(LOCAL_BID_DEPTH_EVENT) {
                     instrument
                         .depth
@@ -416,6 +426,12 @@ where
             return self.wait_order_response(asset_no, order_id, 60_000_000_000);
         }
         Ok(ElapseResult::Ok)
+    }
+
+    /// QUI-86：最新 bookTicker BBO `(bid, bid_qty, ask, ask_qty)`，无 bookTicker feed 过 → None。
+    /// 独立于 depth 的 best_bid()/best_ask()（那两个走 L2 推导）；策略要 freshest BBO 时读这个。
+    pub fn bbo(&self, asset_no: usize) -> Option<(f64, f64, f64, f64)> {
+        self.instruments.get(asset_no).and_then(|i| i.last_bbo)
     }
 }
 

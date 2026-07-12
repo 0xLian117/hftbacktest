@@ -61,7 +61,9 @@ impl UserDataStream {
 
     fn process_message(&self, stream: EventStream) -> Result<(), BinanceFuturesError> {
         match stream {
-            EventStream::DepthUpdate(_) | EventStream::Trade(_) => unreachable!(),
+            EventStream::DepthUpdate(_) | EventStream::Trade(_) | EventStream::BookTicker(_) => {
+                unreachable!() // market-data 变体不该到 user stream
+            }
             EventStream::ListenKeyExpired(_) => {
                 return Err(BinanceFuturesError::ListenKeyExpired);
             }
