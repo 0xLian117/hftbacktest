@@ -164,35 +164,46 @@ impl MarketDataStream {
 
     /// bookTicker → 两条 BBO Feed（QUI-106，bot 存进 Instrument.last_bbo，不进 L2）。
     /// 现货 bookTicker 无交易所时戳 → exch_ts=local_ts=now（feed_latency local 侧仍准，farm feed-age guard 照常）。
-    /// 不 batch（BBO 独立顶档）、不 u 去重（覆盖写，同 QUI-86）。
+    /// **BatchStart..BatchEnd 包住 bid+ask**：一帧的 bid/ask 原子可见——bot 在 batch 内处理完两条才在
+    /// BatchEnd 返回 elapse（bot.rs elapse_：batch_mode 里 MarketFeed 不早返回），消除「新 bid+旧 ask」
+    /// 半更新窗口（否则急涨/急跌时 bbo 会瞬时内部交叉，farm_guard 会拒该报价空跑一轮，QUI-106 validate 实测）。
+    /// 不 u 去重（覆盖写，同 QUI-86）。
     fn process_book_ticker(&self, data: stream::BookTicker) {
         let now = Utc::now().timestamp_nanos_opt().unwrap();
         let sides = [
             (LOCAL_BID_DEPTH_BBO_EVENT, data.best_bid, data.best_bid_qty),
             (LOCAL_ASK_DEPTH_BBO_EVENT, data.best_ask, data.best_ask_qty),
         ];
-        for (ev_kind, px_s, qty_s) in sides {
+        // 先解析两侧;任一侧解析失败则整帧丢弃(不发半帧,避免只更一侧造成的交叉)。
+        let mut parsed = [(0u64, 0.0f64, 0.0f64); 2];
+        for (i, (ev_kind, px_s, qty_s)) in sides.into_iter().enumerate() {
             match parse_px_qty_tup(px_s, qty_s) {
-                Ok((px, qty)) => {
-                    self.ev_tx
-                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                            symbol: data.symbol.clone(),
-                            event: Event {
-                                ev: ev_kind,
-                                exch_ts: now,
-                                local_ts: now,
-                                order_id: 0,
-                                px,
-                                qty,
-                                ival: 0,
-                                fval: 0.0,
-                            },
-                        }))
-                        .unwrap();
+                Ok((px, qty)) => parsed[i] = (ev_kind, px, qty),
+                Err(e) => {
+                    error!(error = ?e, "Couldn't parse spot bookTicker px/qty — drop frame.");
+                    return;
                 }
-                Err(e) => error!(error = ?e, "Couldn't parse spot bookTicker px/qty."),
             }
         }
+        self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
+        for (ev_kind, px, qty) in parsed {
+            self.ev_tx
+                .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                    symbol: data.symbol.clone(),
+                    event: Event {
+                        ev: ev_kind,
+                        exch_ts: now,
+                        local_ts: now,
+                        order_id: 0,
+                        px,
+                        qty,
+                        ival: 0,
+                        fval: 0.0,
+                    },
+                }))
+                .unwrap();
+        }
+        self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
     }
 
     fn process_message(&mut self, stream: MarketEventStream) {

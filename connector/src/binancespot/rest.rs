@@ -151,8 +151,11 @@ impl BinanceSpotClient {
     }
 
     pub async fn get_depth(&self, symbol: &str) -> Result<rest::Depth, reqwest::Error> {
+        // SPOT depth REST 要大写 symbol(小写 → -1100,错误体无 lastUpdateId → decode 失败)。
+        // 同 F3 大写坑,延伸到 market-data 路径(QUI-105 只修了下单路径;旧「natural refresh」不依赖
+        // 快照故没暴露,新序列化 buffer-until-snapshot 触发了它)。用规范 /api/v3/depth。
         let resp: rest::Depth = self
-            .get_noauth("/api/v1/depth", format!("symbol={symbol}&limit=1000"))
+            .get_noauth("/api/v3/depth", format!("symbol={}&limit=1000", symbol.to_uppercase()))
             .await?;
         Ok(resp)
     }
