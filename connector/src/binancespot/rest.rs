@@ -163,8 +163,9 @@ impl BinanceSpotClient {
     }
 
     pub async fn cancel_all_orders(&self, symbol: &str) -> Result<(), reqwest::Error> {
+        // Binance SPOT 严格要求 symbol 大写(-1100),不同于容忍小写的 futures。stream 订阅用小写。
         let _: serde_json::Value = self
-            .delete("/api/v3/openOrders", format!("symbol={symbol}"))
+            .delete("/api/v3/openOrders", format!("symbol={}", symbol.to_uppercase()))
             .await?;
         Ok(())
     }
@@ -176,7 +177,7 @@ impl BinanceSpotClient {
     ) -> Result<CancelOrderResponse, BinanceSpotError> {
         let mut body = String::with_capacity(100);
         body.push_str("symbol=");
-        body.push_str(symbol);
+        body.push_str(&symbol.to_uppercase()); // SPOT 要大写(-1100)
         body.push_str("&origClientOrderId=");
         body.push_str(client_order_id);
 
@@ -205,7 +206,7 @@ impl BinanceSpotClient {
         body.push_str("newClientOrderId=");
         body.push_str(client_order_id);
         body.push_str("&symbol=");
-        body.push_str(symbol);
+        body.push_str(&symbol.to_uppercase()); // SPOT 要大写(-1100)
         body.push_str("&side=");
         body.push_str(side.as_ref());
         body.push_str("&price=");
