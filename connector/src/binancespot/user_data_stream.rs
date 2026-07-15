@@ -132,13 +132,17 @@ impl UserDataStream {
                 timestamp: get_timestamp(),
             },
         };
-        if let Ok(payload) = serde_qs::to_string(&req) {
-            let signature = sign_ed25519(&self.client.secret, &payload);
-            req.params.signature = Some(signature);
-            let _ = write
-                .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
-                .await;
-        }
+        // session.logon 签名负载 = params(字母序,仅 apiKey+timestamp),不是整个 SignRequest。
+        // 之前 serde_qs(整个 req) 含 id/method/params[...] 嵌套 → Binance 拒登录 (ws 1008)。
+        let payload = format!(
+            "apiKey={}&timestamp={}",
+            req.params.api_key, req.params.timestamp
+        );
+        let signature = sign_ed25519(&self.client.secret, &payload);
+        req.params.signature = Some(signature);
+        let _ = write
+            .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
+            .await;
 
         tokio::spawn(async move {
             // Cancel all orders before connecting to the stream in order to start with the
