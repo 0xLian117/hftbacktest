@@ -247,36 +247,13 @@ fn handle_ev(
                         event: event.clone(),
                     })
                     .collect();
-            } else if event.is(BUY_EVENT | DEPTH_BBO_EVENT) {
-                let depth_ = {
-                    match depth.get_mut(symbol) {
-                        Some(d) => d,
-                        None => return vec![],
-                    }
-                };
-                return depth_
-                    .update_best_bid(event.clone())
-                    .iter()
-                    .map(|event| LiveEvent::Feed {
-                        symbol: symbol.clone(),
-                        event: event.clone(),
-                    })
-                    .collect();
-            } else if event.is(SELL_EVENT | DEPTH_BBO_EVENT) {
-                let depth_ = {
-                    match depth.get_mut(symbol) {
-                        Some(d) => d,
-                        None => return vec![],
-                    }
-                };
-                return depth_
-                    .update_best_ask(event.clone())
-                    .iter()
-                    .map(|event| LiveEvent::Feed {
-                        symbol: symbol.clone(),
-                        event: event.clone(),
-                    })
-                    .collect();
+            } else if event.is(BUY_EVENT | DEPTH_BBO_EVENT) || event.is(SELL_EVENT | DEPTH_BBO_EVENT) {
+                // QUI-106:BBO(bookTicker)直通到 bot.last_bbo,**不进连接器 L2 融合**。
+                // 下单用 bbo(实时最快)、特征用 depth(L2 多档),两路本就分开(QUI-86 intent:bbo 不进 L2)。
+                // 之前把 BBO 融进 FusedHashMapMarketDepth,因时间戳跨域(现货 bookTicker 无交易所时戳→用
+                // local now,vs L2 的 Binance event_time)被融合的 staleness 判据误判过时丢弃 → last_bbo
+                // 一侧陈旧 → 急动时瞬时内部交叉(validate 实测 0.07%)。直通后每帧 BBO 必达、不丢。
+                return vec![ev];
             } else if event.is(DEPTH_CLEAR_EVENT) {
                 let depth_ = {
                     match depth.get_mut(symbol) {
