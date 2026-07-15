@@ -213,10 +213,16 @@ impl BinanceSpotClient {
         body.push_str(&format!("{price:.price_prec$}"));
         body.push_str("&quantity=");
         body.push_str(&format!("{qty:.5}"));
-        body.push_str("&type=");
-        body.push_str(order_type.as_ref());
-        body.push_str("&timeInForce=");
-        body.push_str(time_in_force.as_ref());
+        // Binance SPOT post-only = order type LIMIT_MAKER(无 timeInForce)。现货不认 GTX
+        // (-1115);GTX 是 futures 的 post-only timeInForce。其余 TIF 照常 type+timeInForce。
+        if matches!(time_in_force, TimeInForce::GTX) {
+            body.push_str("&type=LIMIT_MAKER");
+        } else {
+            body.push_str("&type=");
+            body.push_str(order_type.as_ref());
+            body.push_str("&timeInForce=");
+            body.push_str(time_in_force.as_ref());
+        }
 
         let resp: OrderResponseResult = self.post("/api/v3/order", body).await?;
         match resp {
