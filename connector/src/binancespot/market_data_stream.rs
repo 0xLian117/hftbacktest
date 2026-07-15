@@ -34,12 +34,21 @@ use crate::{
     utils::{generate_rand_string, parse_depth, parse_px_qty_tup},
 };
 
+/// 每 symbol 的 L2 depth 同步态（QUI-106，Binance 现货官方 local-order-book 算法）。
+/// 现货 depth diff 有 U(first_update_id)/u(last_update_id)，**无 futures 的 pu** → 用 U/u 连续性。
+enum DepthSync {
+    /// 已请求 REST 快照，其间到达的 diff 先缓冲；快照到达后 drop-stale + align + 回放。
+    AwaitingSnapshot { buffer: Vec<stream::Depth> },
+    /// 已对齐；稳态要求下一条 diff 的 U == prev_u + 1，违反则 resync。
+    Synced { prev_u: i64 },
+}
+
 pub struct MarketDataStream {
     client: BinanceSpotClient,
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
-    pending_depth_messages: HashMap<String, Vec<stream::Depth>>,
-    prev_u: HashMap<String, i64>,
+    depth_sync: HashMap<String, DepthSync>,
+    resync_count: HashMap<String, u64>,
     rest_tx: UnboundedSender<(String, rest::Depth)>,
     rest_rx: UnboundedReceiver<(String, rest::Depth)>,
 }
@@ -55,98 +64,168 @@ impl MarketDataStream {
             client,
             ev_tx,
             symbol_rx,
-            pending_depth_messages: Default::default(),
-            prev_u: Default::default(),
+            depth_sync: Default::default(),
+            resync_count: Default::default(),
             rest_tx,
             rest_rx,
+        }
+    }
+
+    /// 异步取 REST depth 快照 → 回 rest_rx → process_snapshot 对齐。
+    fn request_snapshot(&self, symbol: &str) {
+        let client_ = self.client.clone();
+        let symbol = symbol.to_string();
+        let rest_tx = self.rest_tx.clone();
+        tokio::spawn(async move {
+            match client_.get_depth(&symbol).await {
+                Ok(depth) => {
+                    let _ = rest_tx.send((symbol, depth));
+                }
+                Err(error) => {
+                    error!(?error, %symbol, "Couldn't get the market depth via REST.");
+                }
+            }
+        });
+    }
+
+    /// 发一批 L2 档位事件（BatchStart..BatchEnd）。diff 用 `event_time*1e6`，快照体用 local now（GAP#1）。
+    fn emit_depth(
+        &self,
+        symbol: &str,
+        bids: Vec<(String, String)>,
+        asks: Vec<(String, String)>,
+        exch_ts: i64,
+    ) {
+        match parse_depth(bids, asks) {
+            Ok((bids, asks)) => {
+                self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
+                for (px, qty) in bids {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: symbol.to_string(),
+                            event: Event {
+                                ev: LOCAL_BID_DEPTH_EVENT,
+                                exch_ts,
+                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                                order_id: 0,
+                                px,
+                                qty,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
+                }
+                for (px, qty) in asks {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: symbol.to_string(),
+                            event: Event {
+                                ev: LOCAL_ASK_DEPTH_EVENT,
+                                exch_ts,
+                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                                order_id: 0,
+                                px,
+                                qty,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
+                }
+                self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+            }
+            Err(error) => {
+                error!(?error, "Couldn't parse depth levels.");
+            }
+        }
+    }
+
+    /// 快照前清两侧（GAP#3，mirror futures）：快照只带非零档，重同步时旧档否则会残留（幽灵档 QUI-79）。
+    fn clear_both(&self, symbol: &str, exch_ts: i64) {
+        for clear_ev in [LOCAL_BID_DEPTH_CLEAR_EVENT, LOCAL_ASK_DEPTH_CLEAR_EVENT] {
+            self.ev_tx
+                .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                    symbol: symbol.to_string(),
+                    event: Event {
+                        ev: clear_ev,
+                        exch_ts,
+                        local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
+                        order_id: 0,
+                        px: f64::NAN,
+                        qty: 0.0,
+                        ival: 0,
+                        fval: 0.0,
+                    },
+                }))
+                .unwrap();
+        }
+    }
+
+    /// bookTicker → 两条 BBO Feed（QUI-106，bot 存进 Instrument.last_bbo，不进 L2）。
+    /// 现货 bookTicker 无交易所时戳 → exch_ts=local_ts=now（feed_latency local 侧仍准，farm feed-age guard 照常）。
+    /// 不 batch（BBO 独立顶档）、不 u 去重（覆盖写，同 QUI-86）。
+    fn process_book_ticker(&self, data: stream::BookTicker) {
+        let now = Utc::now().timestamp_nanos_opt().unwrap();
+        let sides = [
+            (LOCAL_BID_DEPTH_BBO_EVENT, data.best_bid, data.best_bid_qty),
+            (LOCAL_ASK_DEPTH_BBO_EVENT, data.best_ask, data.best_ask_qty),
+        ];
+        for (ev_kind, px_s, qty_s) in sides {
+            match parse_px_qty_tup(px_s, qty_s) {
+                Ok((px, qty)) => {
+                    self.ev_tx
+                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
+                            symbol: data.symbol.clone(),
+                            event: Event {
+                                ev: ev_kind,
+                                exch_ts: now,
+                                local_ts: now,
+                                order_id: 0,
+                                px,
+                                qty,
+                                ival: 0,
+                                fval: 0.0,
+                            },
+                        }))
+                        .unwrap();
+                }
+                Err(e) => error!(error = ?e, "Couldn't parse spot bookTicker px/qty."),
+            }
         }
     }
 
     fn process_message(&mut self, stream: MarketEventStream) {
         match stream {
             MarketEventStream::DepthUpdate(data) => {
-                let prev_u_val = self.prev_u.get_mut(&data.symbol);
-                if prev_u_val.is_none()
-                /* fixme: || data.prev_update_id != **prev_u_val.as_ref().unwrap()*/
-                {
-                    // if !pending_depth_messages.contains_key(&data.symbol) {
-                    let client_ = self.client.clone();
-                    let symbol = data.symbol.clone();
-                    let rest_tx = self.rest_tx.clone();
-                    tokio::spawn(async move {
-                        let resp = client_.get_depth(&symbol).await;
-                        match resp {
-                            Ok(depth) => {
-                                rest_tx.send((symbol, depth)).unwrap();
-                            }
-                            Err(error) => {
-                                error!(
-                                    ?error,
-                                    %symbol,
-                                    "Couldn't get the market depth via REST."
-                                );
-                            }
+                let sym = data.symbol.clone();
+                // 决策阶段:不跨 self 方法调用持有 depth_sync 的可变借用。
+                // emit=Some(bids,asks,exch_ts) 稳态发档;resync=Some(diff,is_gap) 需(重)取快照。
+                let mut emit: Option<(Vec<(String, String)>, Vec<(String, String)>, i64)> = None;
+                let mut resync: Option<(stream::Depth, bool)> = None;
+                match self.depth_sync.get_mut(&sym) {
+                    Some(DepthSync::AwaitingSnapshot { buffer }) => buffer.push(data),
+                    Some(DepthSync::Synced { prev_u }) => {
+                        if data.first_update_id == *prev_u + 1 {
+                            *prev_u = data.last_update_id; // 持锁时推进
+                            emit = Some((data.bids, data.asks, data.event_time * 1_000_000));
+                        } else {
+                            warn!(%sym, expected = *prev_u + 1, got = data.first_update_id, "spot depth gap — resync");
+                            resync = Some((data, true));
                         }
-                    });
-                    // }
-                    // pending_depth_messages
-                    //     .entry(data.symbol.clone())
-                    //     .or_insert(Vec::new())
-                    //     .push(data);
-                    // continue;
+                    }
+                    None => resync = Some((data, false)), // 首个 diff:缓冲 + 取快照(非 gap,不计数)
                 }
-                // *prev_u_val.unwrap() = data.last_update_id;
-                // fixme: currently supports natural refresh only.
-                *self
-                    .prev_u
-                    .entry(data.symbol.clone())
-                    .or_insert(data.last_update_id) = data.last_update_id;
-
-                match parse_depth(data.bids, data.asks) {
-                    Ok((bids, asks)) => {
-                        self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
-
-                        for (px, qty) in bids {
-                            self.ev_tx
-                                .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                    symbol: data.symbol.clone(),
-                                    event: Event {
-                                        ev: LOCAL_BID_DEPTH_EVENT,
-                                        exch_ts: data.event_time * 1_000_000,
-                                        local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                        order_id: 0,
-                                        px,
-                                        qty,
-                                        ival: 0,
-                                        fval: 0.0,
-                                    },
-                                }))
-                                .unwrap();
-                        }
-
-                        for (px, qty) in asks {
-                            self.ev_tx
-                                .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                                    symbol: data.symbol.clone(),
-                                    event: Event {
-                                        ev: LOCAL_ASK_DEPTH_EVENT,
-                                        exch_ts: data.event_time * 1_000_000,
-                                        local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                        order_id: 0,
-                                        px,
-                                        qty,
-                                        ival: 0,
-                                        fval: 0.0,
-                                    },
-                                }))
-                                .unwrap();
-                        }
-
-                        self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+                if let Some((bids, asks, exch_ts)) = emit {
+                    self.emit_depth(&sym, bids, asks, exch_ts);
+                }
+                if let Some((diff, is_gap)) = resync {
+                    if is_gap {
+                        *self.resync_count.entry(sym.clone()).or_insert(0) += 1;
                     }
-                    Err(error) => {
-                        error!(?error, "Couldn't parse DepthUpdate stream.");
-                    }
+                    self.depth_sync
+                        .insert(sym.clone(), DepthSync::AwaitingSnapshot { buffer: vec![diff] });
+                    self.request_snapshot(&sym);
                 }
             }
             MarketEventStream::Trade(data) => match parse_px_qty_tup(data.price, data.quantity) {
@@ -184,82 +263,53 @@ impl MarketDataStream {
         }
     }
 
-    fn process_snapshot(&self, symbol: String, data: rest::Depth) {
-        match parse_depth(data.bids, data.asks) {
-            Ok((bids, asks)) => {
-                self.ev_tx.send(PublishEvent::BatchStart(TO_ALL)).unwrap();
-
-                for (px, qty) in bids {
-                    self.ev_tx
-                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                            symbol: symbol.clone(),
-                            event: Event {
-                                ev: LOCAL_BID_DEPTH_EVENT,
-                                exch_ts: data.last_update_id * 1_000_000,
-                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                order_id: 0,
-                                px,
-                                qty,
-                                ival: 0,
-                                fval: 0.0,
-                            },
-                        }))
-                        .unwrap();
-                }
-
-                for (px, qty) in asks {
-                    self.ev_tx
-                        .send(PublishEvent::LiveEvent(LiveEvent::Feed {
-                            symbol: symbol.clone(),
-                            event: Event {
-                                ev: LOCAL_ASK_DEPTH_EVENT,
-                                exch_ts: data.last_update_id * 1_000_000,
-                                local_ts: Utc::now().timestamp_nanos_opt().unwrap(),
-                                order_id: 0,
-                                px,
-                                qty,
-                                ival: 0,
-                                fval: 0.0,
-                            },
-                        }))
-                        .unwrap();
-                }
-
-                self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
+    /// REST 快照到达:Binance 现货官方 local-order-book 对齐(drop-stale + first-align + U/u 连续回放)。
+    fn process_snapshot(&mut self, symbol: String, data: rest::Depth) {
+        // 仅当正等待本 symbol 快照时才处理并取出缓冲;否则丢弃(raced/重复 REST 回复)。
+        let buffer = match self.depth_sync.get_mut(&symbol) {
+            Some(DepthSync::AwaitingSnapshot { buffer }) => std::mem::take(buffer),
+            _ => {
+                debug!(%symbol, "snapshot arrived but not awaiting — drop (raced resync)");
+                return;
             }
-            Err(error) => {
-                error!(?error, "Couldn't parse Depth response.");
+        };
+        let snap_id = data.last_update_id;
+        let now = Utc::now().timestamp_nanos_opt().unwrap();
+        // 先 CLEAR 两侧(GAP#3),再发快照体。快照体 exch_ts=local now(GAP#1:现货 REST Depth 无交易所时戳)。
+        self.clear_both(&symbol, now);
+        self.emit_depth(&symbol, data.bids, data.asks, now);
+
+        // 回放缓冲 diff:drop u<=lastUpdateId;首个 survivor U<=lastUpdateId+1<=u;之后 U==prev_u+1。
+        // ⚠️ 回放 diff 各用自己的 event_time*1e6(现货 diff 有 E),不套快照的 local-now。
+        let mut prev_u = snap_id;
+        let mut aligned = false;
+        for d in buffer {
+            if d.last_update_id <= snap_id {
+                continue; // 快照已覆盖
             }
+            let ok = if !aligned {
+                let first_ok = d.first_update_id <= snap_id + 1 && snap_id + 1 <= d.last_update_id;
+                if first_ok {
+                    aligned = true;
+                }
+                first_ok
+            } else {
+                d.first_update_id == prev_u + 1
+            };
+            if !ok {
+                warn!(%symbol, snap_id, U = d.first_update_id, u = d.last_update_id, prev_u, aligned, "snapshot/buffer gap — resync");
+                *self.resync_count.entry(symbol.clone()).or_insert(0) += 1;
+                // 丢弃已 desync 的缓冲,起空缓冲重取快照;后续 live diff 会重新缓冲。
+                self.depth_sync
+                    .insert(symbol.clone(), DepthSync::AwaitingSnapshot { buffer: Vec::new() });
+                self.request_snapshot(&symbol);
+                return;
+            }
+            let exch_ts = d.event_time * 1_000_000;
+            prev_u = d.last_update_id;
+            self.emit_depth(&symbol, d.bids, d.asks, exch_ts);
         }
-        // fixme: waits for pending messages without blocking.
-        // prev_u.remove(&symbol);
-        // let mut new_prev_u: Option<i64> = None;
-        // while new_prev_u.is_none() {
-        //     if let Some(msg) = pending_depth_messages.get_mut(&symbol) {
-        //         for pending_depth in msg.into_iter() {
-        //             // https://binance-docs.github.io/apidocs/futures/en/#how-to-manage-a-local-order-book-correctly
-        //             // The first processed event should have U <= lastUpdateId AND u >= lastUpdateId
-        //             if (
-        //                 pending_depth.last_update_id < resp.last_update_id
-        //                 || pending_depth.first_update_id > resp.last_update_id
-        //             ) && new_prev_u.is_none() {
-        //                 continue;
-        //             }
-        //             if new_prev_u.is_some() && pending_depth.prev_update_id != *new_prev_u.as_ref().unwrap() {
-        //                 warn!(%symbol, ?pending_depth, "UpdateId does not match.");
-        //             }
-        //
-        //             // Processes a pending depth message
-        //             new_prev_u = Some(pending_depth.last_update_id);
-        //             *prev_u.entry(symbol.clone())
-        //                 .or_insert(pending_depth.last_update_id) = pending_depth.last_update_id;
-        //         }
-        //     }
-        //     if new_prev_u.is_none() {
-        //         // Waits for depth messages.
-        //         todo!()
-        //     }
-        // }
+        self.depth_sync.insert(symbol, DepthSync::Synced { prev_u });
     }
 
     pub async fn connect(&mut self, url: &str) -> Result<(), BinanceSpotError> {
@@ -287,7 +337,8 @@ impl MarketDataStream {
                             "method": "SUBSCRIBE",
                             "params": [
                                 "{symbol}@trade",
-                                "{symbol}@depth@100ms"
+                                "{symbol}@depth@100ms",
+                                "{symbol}@bookTicker"
                             ],
                             "id": "{id}"
                         }}"#).into())).await?;
@@ -304,6 +355,9 @@ impl MarketDataStream {
                         match serde_json::from_str::<MarketStream>(&text) {
                             Ok(MarketStream::EventStream(stream)) => {
                                 self.process_message(stream);
+                            }
+                            Ok(MarketStream::BookTicker(bt)) => {
+                                self.process_book_ticker(bt);
                             }
                             Ok(MarketStream::Result(result)) => {
                                 debug!(?result, "Subscription request response is received.");

@@ -36,10 +36,33 @@ pub struct Result {
     pub id: String,
 }
 
+/// 现货 `<symbol>@bookTicker` 帧（实时 BBO）。⚠️ 与 futures 不同：**无 `e`/`T`/`E` 字段**
+/// （keys 仅 u/s/b/B/a/A，2026-07-15 实测抓帧确认）。故不能进 `#[serde(tag="e")]` 的
+/// `MarketEventStream`（匹配不中被丢），只能进下面 untagged 的 `MarketStream`。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BookTicker {
+    #[serde(rename = "u")]
+    pub update_id: i64,
+    #[serde(rename = "s")]
+    #[serde(deserialize_with = "to_lowercase")]
+    pub symbol: String,
+    #[serde(rename = "b")]
+    pub best_bid: String,
+    #[serde(rename = "B")]
+    pub best_bid_qty: String,
+    #[serde(rename = "a")]
+    pub best_ask: String,
+    #[serde(rename = "A")]
+    pub best_ask_qty: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum MarketStream {
     EventStream(MarketEventStream),
+    // BookTicker 放 Result 前：无 `e` 不误匹配 tagged EventStream；无 `id` 不误匹配 Result；
+    // depthUpdate 的 b/a 是数组不误匹配这里的 String 字段。
+    BookTicker(BookTicker),
     Result(Result),
 }
 
@@ -435,4 +458,50 @@ pub struct UserDataRequest {
 pub struct UserStreamSubscribeRequest {
     pub id: String,
     pub method: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MarketEventStream, MarketStream};
+
+    // QUI-106 序列化回归守卫：把「实测抓帧」变回归。三类帧各落对臂。
+    // 现货 bookTicker 无 "e" 字段 → 必须由 untagged MarketStream::BookTicker 兜住。
+    #[test]
+    fn bookticker_frame_routes_to_bookticker() {
+        // 2026-07-15 实测抓帧形状：keys u/s/b/B/a/A，无 e/T/E。
+        let f = r#"{"u":400900217,"s":"BTCFDUSD","b":"64845.00","B":"0.04891","a":"64845.01","A":"0.01023"}"#;
+        let m: MarketStream = serde_json::from_str(f).unwrap();
+        match m {
+            MarketStream::BookTicker(bt) => {
+                assert_eq!(bt.update_id, 400900217);
+                assert_eq!(bt.symbol, "btcfdusd"); // to_lowercase
+                assert_eq!(bt.best_bid, "64845.00");
+                assert_eq!(bt.best_ask_qty, "0.01023");
+            }
+            other => panic!("bookTicker frame mis-routed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn depthupdate_frame_routes_to_eventstream() {
+        let f = r#"{"e":"depthUpdate","E":1720000000000,"s":"BTCFDUSD","U":1,"u":2,"b":[["64845.0","0.1"]],"a":[["64845.01","0.2"]]}"#;
+        let m: MarketStream = serde_json::from_str(f).unwrap();
+        match m {
+            MarketStream::EventStream(MarketEventStream::DepthUpdate(d)) => {
+                assert_eq!(d.first_update_id, 1);
+                assert_eq!(d.last_update_id, 2);
+            }
+            other => panic!("depthUpdate frame mis-routed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_result_frame_routes_to_result() {
+        let f = r#"{"result":null,"id":"abc123"}"#;
+        let m: MarketStream = serde_json::from_str(f).unwrap();
+        match m {
+            MarketStream::Result(r) => assert_eq!(r.id, "abc123"),
+            other => panic!("Result frame mis-routed: {other:?}"),
+        }
+    }
 }
