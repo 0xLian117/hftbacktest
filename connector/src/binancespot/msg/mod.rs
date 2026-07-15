@@ -49,6 +49,10 @@ where
     let s: &str = Deserialize::deserialize(deserializer)?;
     match s {
         "LIMIT" => Ok(OrdType::Limit),
+        // SPOT post-only 下单 type=LIMIT_MAKER,Binance 响应回显 "LIMIT_MAKER" → 映射到 Limit
+        // (OrdType 无 LimitMaker 变体,bot 内部不区分)。缺此分支 → 新单响应整体解码失败 → 订单被误当
+        // 提交失败(Status::Expired)、实际已在交易所 resting → farm 幽灵仓位(QUI-106 真根因)。
+        "LIMIT_MAKER" => Ok(OrdType::Limit),
         "MARKET" => Ok(OrdType::Market),
         // "STOP" => Ok(OrdType::StopLimit),
         // "TAKE_PROFIT" => Ok(OrdType::TakeProfitLimit),
