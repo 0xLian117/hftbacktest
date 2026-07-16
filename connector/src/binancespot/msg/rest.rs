@@ -93,7 +93,9 @@ pub struct CancelOrderResponse {
     pub orig_qty: f64,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub executed_qty: f64,
-    #[serde(deserialize_with = "from_str_to_f64")]
+    // 与 OrderResponse 对齐:撤单响应也可能省略这些字段(版本/状态而异),缺则整个 untagged 解码失败
+    // → 成功撤单被当错误 → farm 以为单还在 → 孤儿(Codex P1)。
+    #[serde(default, deserialize_with = "from_str_to_f64")]
     pub orig_quote_order_qty: f64,
     #[serde(deserialize_with = "from_str_to_f64")]
     pub cummulative_quote_qty: f64,
@@ -106,6 +108,7 @@ pub struct CancelOrderResponse {
     pub order_type: OrdType,
     #[serde(deserialize_with = "from_str_to_side")]
     pub side: Side,
+    #[serde(default)]
     pub self_trade_prevention_mode: String,
 }
 
