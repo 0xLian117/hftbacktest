@@ -226,6 +226,10 @@ impl BinanceSpotClient {
             body.push_str("&timeInForce=");
             body.push_str(time_in_force.as_ref());
         }
+        // Binance SPOT LIMIT_MAKER 默认响应类型是 ACK(只含 5 字段:symbol/orderId/orderListId/clientOrderId/transactTime)。
+        // 不显式请求 FULL → OrderResponse 的 price/origQty/status 等必填字段缺失 → untagged decode 失败
+        // → "data did not match any variant" → 订单被误当 Expired → farm 幽灵仓位。
+        body.push_str("&newOrderRespType=FULL");
 
         let resp: OrderResponseResult = self.post("/api/v3/order", body).await?;
         match resp {

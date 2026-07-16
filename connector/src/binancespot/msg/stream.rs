@@ -76,6 +76,11 @@ pub enum UserStream {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct UserDataEvent {
+    // Binance spot executionReport 是扁平 JSON({"e":"executionReport","E":...,...})，
+    // UserEventStream 用 #[serde(tag="e")] 匹配 e 字段。若无 flatten，serde 在外层 JSON 里
+    // 找 key "event"(Rust 字段名)，找不到 → UserDataEvent 解码失败 → executionReport/fill
+    // 事件整体丢弃 → farm 从不看到 Filled → 超时/moved → cancel → 幽灵仓位(BUG B)。
+    #[serde(flatten)]
     pub event: UserEventStream,
 }
 
@@ -502,6 +507,46 @@ mod tests {
         match m {
             MarketStream::Result(r) => assert_eq!(r.id, "abc123"),
             other => panic!("Result frame mis-routed: {other:?}"),
+        }
+    }
+
+    // QUI-106 BUG-B 回归:executionReport(maker fill)必须解成 UserStream::EventStream。
+    // 修前 UserDataEvent.event 无 #[serde(flatten)] → serde 找 JSON key "event" → 找不到 → decode 失败
+    // → fill 事件丢弃 → farm 永远看不到 Filled → timeout/moved → cancel → 幽灵仓位。
+    #[test]
+    fn execution_report_fill_routes_to_eventstream() {
+        use super::{UserEventStream, UserStream};
+        // 真实 Binance Spot executionReport(maker fill,LIMIT_MAKER,FILLED)。
+        // 字段: e=executionReport,E=event_time,s=symbol,c=clientOrderId,S=side,o=type,
+        //       f=tif,q=qty,p=price,P=stopPrice,F=icebergQty,g=orderListId,C=origClientOrderId,
+        //       x=execType,X=orderStatus,r=rejectReason,i=orderId,l=lastFillQty,z=cumFillQty,
+        //       L=lastFillPrice,n=commission,N=commissionAsset,T=orderTradeTime,t=tradeId,
+        //       I=execId,w=onBook,m=isMaker,M=ignore,O=orderCreateTime,Z=cumQuoteQty,
+        //       Y=lastQuoteQty,Q=quoteOrderQty,V=selfTradePreventionMode.
+        let f = r#"{
+            "e":"executionReport","E":1784163541916,"s":"btcfdusd","c":"m1sABC",
+            "S":"BUY","o":"LIMIT_MAKER","f":"GTC","q":"0.00008000","p":"64699.03000000",
+            "P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"TRADE","X":"FILLED",
+            "r":"NONE","i":25749045654,"l":"0.00008000","z":"0.00008000",
+            "L":"64699.03000000","n":"0.00000008","N":"BTC","T":1784163541916,"t":123456,
+            "I":999,"w":false,"m":true,"M":false,"O":1784163492705,
+            "Z":"5.17592240","Y":"5.17592240","Q":"0.00000000","V":"EXPIRE_MAKER"
+        }"#;
+        let u: UserStream = serde_json::from_str(f).expect("executionReport must decode");
+        match u {
+            UserStream::EventStream(ref ev) => match &ev.event {
+                UserEventStream::ExecutionReport(report) => {
+                    assert_eq!(report.order_id, 25749045654);
+                    // order_last_filled_quantity = field "l" = 0.00008
+                    assert!((report.order_last_filled_quantity - 0.00008).abs() < 1e-10,
+                        "last fill qty wrong: {}", report.order_last_filled_quantity);
+                    // order_filled_accumulated_quantity = field "z" = 0.00008
+                    assert!((report.order_filled_accumulated_quantity - 0.00008).abs() < 1e-10);
+                    assert!(report.is_maker);
+                }
+                other => panic!("wrong UserEventStream variant: {other:?}"),
+            },
+            other => panic!("executionReport mis-routed (fill event silently dropped?): {other:?}"),
         }
     }
 }

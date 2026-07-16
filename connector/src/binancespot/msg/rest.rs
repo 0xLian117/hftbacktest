@@ -68,7 +68,10 @@ pub struct ErrorResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+// untagged: Binance 取消响应是扁平 JSON(成功→CancelOrderResponse 形状,失败→ErrorResponse 形状)。
+// 无 untagged 时 serde 用外部标记({"ok":{...}})匹配,Binance 不这样→成功撤单解码失败→
+// cancel 被当作错误→update_cancel_fail(非-2011)→order 状态不变→farm 误认单仍 New→幽灵单。
+#[serde(untagged)]
 pub enum CancelOrderResponseResult {
     Ok(CancelOrderResponse),
     Err(ErrorResponse),
@@ -222,6 +225,46 @@ mod tests {
         match serde_json::from_str::<OrderResponseResult>(json).expect("must decode") {
             OrderResponseResult::Err(e) => assert_eq!(e.code, -2010),
             OrderResponseResult::Ok(_) => panic!("error response mis-decoded as Ok"),
+        }
+    }
+
+    // QUI-106 BUG-A 추가 회귀: LIMIT_MAKER POST 응답 기본값은 ACK(5필드)이므로
+    // newOrderRespType=FULL을 명시적으로 요청해야 FULL 응답이 옴.
+    // ACK 응답은 OrderResponse 필수 필드(price/origQty/status 등)가 없어 decode 실패.
+    // 이 테스트는 ACK 형상이 Ok로 해석되면 안 됨을 검증한다.
+    // (실 운영에서는 rest.rs가 &newOrderRespType=FULL을 추가하므로 이 형상이 올 일 없음.)
+    #[test]
+    fn spot_ack_response_without_full_fields_does_not_decode_as_ok() {
+        // ACK 형상: 5필드만 있음 (Binance LIMIT_MAKER 기본 응답)
+        let ack_json = r#"{
+            "symbol":"BTCFDUSD","orderId":25749045654,"orderListId":-1,
+            "clientOrderId":"m1sabc","transactTime":1784163492705
+        }"#;
+        // untagged enum: OrderResponse 해석 실패 → ErrorResponse 해석 시도 → code/msg 없음 → 실패
+        // 전체 decode 실패여야 함 (둘 다 아님)
+        let result = serde_json::from_str::<OrderResponseResult>(ack_json);
+        assert!(result.is_err(), "ACK-only response must NOT decode as OrderResponseResult Ok or Err — it should fail. Got: {:?}", result);
+    }
+
+    // BUG-A 회귀: FULL 응답 with immediate fill (filled taker, fills populated) decodes Ok.
+    #[test]
+    fn spot_full_response_with_immediate_fill_decodes_ok() {
+        let json = r#"{
+            "symbol":"BTCFDUSD","orderId":25749045654,"orderListId":-1,"clientOrderId":"m1sabc",
+            "transactTime":1784163492705,"price":"64699.03000000","origQty":"0.00008000",
+            "executedQty":"0.00008000","cummulativeQuoteQty":"5.17592240","status":"FILLED",
+            "timeInForce":"GTC","type":"LIMIT_MAKER","side":"BUY",
+            "workingTime":1784163492705,"selfTradePreventionMode":"EXPIRE_MAKER",
+            "fills":[{"price":"64699.03000000","qty":"0.00008000","commission":"0.00000008","commissionAsset":"BTC","tradeId":999}]
+        }"#;
+        match serde_json::from_str::<OrderResponseResult>(json).expect("FULL FILLED response must decode") {
+            OrderResponseResult::Ok(o) => {
+                assert_eq!(o.order_id, 25749045654);
+                assert!((o.executed_qty - 0.00008).abs() < 1e-10);
+                assert_eq!(o.fills.len(), 1);
+                assert!((o.fills[0].qty - 0.00008).abs() < 1e-10);
+            }
+            OrderResponseResult::Err(e) => panic!("FULL FILLED response decoded as error: {e:?}"),
         }
     }
 }
