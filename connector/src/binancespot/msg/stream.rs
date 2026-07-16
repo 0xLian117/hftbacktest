@@ -76,11 +76,10 @@ pub enum UserStream {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct UserDataEvent {
-    // Binance spot executionReport 是扁平 JSON({"e":"executionReport","E":...,...})，
-    // UserEventStream 用 #[serde(tag="e")] 匹配 e 字段。若无 flatten，serde 在外层 JSON 里
-    // 找 key "event"(Rust 字段名)，找不到 → UserDataEvent 解码失败 → executionReport/fill
-    // 事件整体丢弃 → farm 从不看到 Filled → 超时/moved → cancel → 幽灵仓位(BUG B)。
-    #[serde(flatten)]
+    // ⚠️ 实测真实消息是 **wrapper**:{"subscriptionId":0,"event":{"e":"executionReport",...}}
+    // (ws-api userDataStream.subscribe 的包裹)。`event` 是**嵌套键**,内层 `{"e":...}` 由
+    // UserEventStream 的 #[serde(tag="e")] 匹配;`subscriptionId` 是额外字段被 serde 忽略。
+    // **不能加 #[serde(flatten)]**——flatten 会去外层找 "e"(外层只有 subscriptionId+event)→ 全丢。
     pub event: UserEventStream,
 }
 
@@ -522,16 +521,18 @@ mod tests {
         //       x=execType,X=orderStatus,r=rejectReason,i=orderId,l=lastFillQty,z=cumFillQty,
         //       L=lastFillPrice,n=commission,N=commissionAsset,T=orderTradeTime,t=tradeId,
         //       I=execId,w=onBook,m=isMaker,M=ignore,O=orderCreateTime,Z=cumQuoteQty,
-        //       Y=lastQuoteQty,Q=quoteOrderQty,V=selfTradePreventionMode.
-        let f = r#"{
-            "e":"executionReport","E":1784163541916,"s":"btcfdusd","c":"m1sABC",
-            "S":"BUY","o":"LIMIT_MAKER","f":"GTC","q":"0.00008000","p":"64699.03000000",
+        //       Y=lastQuoteQty,Q=quoteOrderQty,W=workingTime,V=selfTradePreventionMode.
+        // ⚠️ 真实消息是 **wrapper**:{"subscriptionId":N,"event":{...executionReport...}}
+        // (2026-07-16 实盘抓帧确认;ws-api userDataStream.subscribe 的包裹)。
+        let f = r#"{"subscriptionId":0,"event":{
+            "e":"executionReport","E":1784165213944,"s":"BTCFDUSD","c":"m1sABC",
+            "S":"BUY","o":"LIMIT_MAKER","f":"GTC","q":"0.00008000","p":"64685.01000000",
             "P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"TRADE","X":"FILLED",
             "r":"NONE","i":25749045654,"l":"0.00008000","z":"0.00008000",
-            "L":"64699.03000000","n":"0.00000008","N":"BTC","T":1784163541916,"t":123456,
-            "I":999,"w":false,"m":true,"M":false,"O":1784163492705,
-            "Z":"5.17592240","Y":"5.17592240","Q":"0.00000000","V":"EXPIRE_MAKER"
-        }"#;
+            "L":"64685.01000000","n":"0.00000000","N":"BNB","T":1784165213943,"t":2222896094,
+            "I":53679698169,"w":false,"m":true,"M":true,"O":1784165200899,
+            "Z":"5.17480080","Y":"5.17480080","Q":"0.00000000","W":1784165200899,"V":"EXPIRE_MAKER"
+        }}"#;
         let u: UserStream = serde_json::from_str(f).expect("executionReport must decode");
         match u {
             UserStream::EventStream(ref ev) => match &ev.event {
