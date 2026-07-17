@@ -161,18 +161,16 @@ impl UserDataStream {
 
         tokio::spawn(async move {
             // Cancel all orders before connecting to the stream in order to start with the
-            // clean state.
+            // clean state. QUI-108：每 symbol 撤净 + openOrders 收敛复查 + 发 Reconciled 信号
+            // （farm 首单 gate 阻塞于此，把 cancel-all 串行化到下单前）。
             for symbol in &symbols {
-                if let Err(error) = cancel_all(
+                sweep_and_report(
                     client.clone(),
                     symbol.clone(),
                     order_manager.clone(),
                     ev_tx.clone(),
                 )
-                .await
-                {
-                    error!(?error, %symbol, "Couldn't cancel all orders.");
-                }
+                .await;
             }
 
             // Fetches the initial states such as positions and open orders.
@@ -216,15 +214,10 @@ impl UserDataStream {
                             let order_manager = self.order_manager.clone();
                             let ev_tx = self.ev_tx.clone();
 
+                            // QUI-108 CRITICAL：late 注册路径也必须发 Reconciled。连接器先连、bot 后
+                            // 注册（systemd 常见）时,该 symbol 只走此路;漏发 → farm gate 超时 crash-loop。
                             tokio::spawn(async move {
-                                if let Err(error) = cancel_all(
-                                    client.clone(),
-                                    symbol.clone(),
-                                    order_manager.clone(),
-                                    ev_tx.clone()
-                                ).await {
-                                    error!(?error, %symbol, "Couldn't cancel all orders.");
-                                }
+                                sweep_and_report(client, symbol, order_manager, ev_tx).await;
                             });
                         }
                         Err(RecvError::Closed) => {
@@ -336,6 +329,47 @@ pub async fn cancel_all(
             .unwrap();
     }
     Ok(())
+}
+
+/// QUI-108 启动对账（per symbol）：连接期 `cancel_all` 扫净 → openOrders 收敛复查 → 发
+/// `LiveEvent::Reconciled { symbol, open_orders }`。farm 首单 gate 阻塞轮询 `reconcile_status`,
+/// 据此把连接器的 cancel-all 串行化到下单之前（解 QUI-109 r3 cancel_all-vs-新单竞态）。
+///
+/// **两条注册路径都必须调用它**（初始 spawn 快照 + late `symbol_rx` 分支）——连接器是独立进程,
+/// 与 bot 的 RegisterInstrument 有启动竞态,漏任一路 → 该 symbol 永不发信号 → farm gate 超时 crash-loop。
+///
+/// **fail-closed**:cancel_all 失败不阻断(仍复查+发信号,count 反映真实残留);openOrders 复查
+/// 全部失败 → 发 `u32::MAX` 哨兵 → farm loud-exit(绝不 default 0 假 clean)。
+pub async fn sweep_and_report(
+    client: BinanceSpotClient,
+    symbol: String,
+    order_manager: SharedOrderManager,
+    ev_tx: UnboundedSender<PublishEvent>,
+) {
+    if let Err(error) = cancel_all(client.clone(), symbol.clone(), order_manager, ev_tx.clone()).await {
+        error!(?error, %symbol, "startup reconcile: cancel_all failed — proceeding to recheck (fail-closed).");
+    }
+    // 收敛复查:DELETE allOpenOrders 后 openOrders 有亚秒最终一致性延迟(镜像 livebot run_reconcile
+    // 的 5×300ms:先睡后查)。取最后一次成功读数;全部失败 → u32::MAX(fail-closed)。
+    let mut open_orders = u32::MAX;
+    for attempt in 0..5 {
+        time::sleep(Duration::from_millis(300)).await;
+        match client.get_open_orders(&symbol).await {
+            Ok(orders) => {
+                open_orders = orders.len() as u32;
+                if open_orders == 0 {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!(?error, %symbol, attempt, "startup reconcile: openOrders query failed (retrying).");
+            }
+        }
+    }
+    if open_orders != 0 {
+        error!(%symbol, open_orders, "startup reconcile: venue NOT clean after cancel-all (farm will refuse to trade).");
+    }
+    let _ = ev_tx.send(PublishEvent::LiveEvent(LiveEvent::Reconciled { symbol, open_orders }));
 }
 
 pub async fn get_position_information(

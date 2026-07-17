@@ -141,6 +141,15 @@ pub enum LiveEvent {
         qty: f64,
         exch_ts: i64,
     },
+    /// Emitted by a live connector once its startup reconciliation for `symbol` has completed
+    /// (cancel-all swept + open orders re-queried to convergence). `open_orders` is the residual
+    /// open-order count for the symbol after the sweep; `0` means the venue is clean. A live bot
+    /// blocks its first order on this so quoting never races the connector's connect-time
+    /// cancel-all. Only produced by the live path — backtest never constructs it.
+    Reconciled {
+        symbol: String,
+        open_orders: u32,
+    },
     Error(LiveError),
 }
 

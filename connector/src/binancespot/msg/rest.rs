@@ -19,6 +19,15 @@ pub enum OrderResponseResult {
     Err(ErrorResponse),
 }
 
+/// GET /api/v3/openOrders 单条挂单（QUI-108 启动对账仅需计数 → 只取必要字段，其余忽略以免
+/// 严格反序列化脆弱）。仅在连接期收敛复查里用来数残留挂单。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenOrder {
+    pub client_order_id: String,
+    pub status: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
@@ -269,5 +278,24 @@ mod tests {
             }
             OrderResponseResult::Err(e) => panic!("FULL FILLED response decoded as error: {e:?}"),
         }
+    }
+
+    // QUI-108:GET /api/v3/openOrders 返回订单数组;OpenOrder 只取 clientOrderId/status,忽略其余字段
+    // (limit_maker/prices/qty 等),用于连接期收敛复查计数。锁住:真实数组 + 空数组都正确解 + 计数。
+    #[test]
+    fn spot_open_orders_array_decodes_and_counts() {
+        let json = r#"[
+            {"symbol":"BTCFDUSD","orderId":1,"orderListId":-1,"clientOrderId":"m2p-7","price":"64000.0",
+             "origQty":"0.001","executedQty":"0.0","status":"NEW","timeInForce":"GTC","type":"LIMIT_MAKER","side":"BUY"},
+            {"symbol":"BTCFDUSD","orderId":2,"orderListId":-1,"clientOrderId":"foreign-x","price":"65000.0",
+             "origQty":"0.002","executedQty":"0.0","status":"NEW","timeInForce":"GTC","type":"LIMIT","side":"SELL"}
+        ]"#;
+        let orders: Vec<super::OpenOrder> = serde_json::from_str(json).expect("openOrders array must decode");
+        assert_eq!(orders.len(), 2); // gate 用总数(非 prefix 过滤,见 plan R4)
+        assert_eq!(orders[0].client_order_id, "m2p-7");
+        assert_eq!(orders[0].status, "NEW");
+        // 空数组(已扫净)→ len 0 → gate 放行
+        let empty: Vec<super::OpenOrder> = serde_json::from_str("[]").expect("empty array must decode");
+        assert_eq!(empty.len(), 0);
     }
 }

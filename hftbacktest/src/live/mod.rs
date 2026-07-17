@@ -27,6 +27,9 @@ pub struct Instrument<MD> {
     // （bookTicker 只给顶档，并进 L2 会造幽灵档，QUI-79 教训）。best_bid()/best_ask()
     // 仍走 L2 推导、零回归；策略要 freshest BBO 时读这个。
     last_bbo: Option<(f64, f64, f64, f64)>,
+    // QUI-108：连接器完成启动对账（连接期 cancel-all 扫净 + openOrders 收敛复查）后发的
+    // 残留挂单数。None = 尚未收到；Some(0) = venue 干净；Some(n>0) = 扫不净。farm 首单前阻塞在此。
+    last_reconcile: Option<u32>,
     state: StateValues,
 }
 
@@ -57,6 +60,7 @@ impl<MD> Instrument<MD> {
             last_feed_latency: None,
             last_order_latency: None,
             last_bbo: None,
+            last_reconcile: None,
             state: Default::default(),
         }
     }

@@ -10,6 +10,7 @@ use crate::{
             AccountInfomation,
             CancelOrderResponse,
             CancelOrderResponseResult,
+            OpenOrder,
             OrderResponse,
             OrderResponseResult,
         },
@@ -162,6 +163,15 @@ impl BinanceSpotClient {
 
     pub async fn get_account_information(&self) -> Result<AccountInfomation, reqwest::Error> {
         let resp: AccountInfomation = self.get("/api/v3/account", String::new()).await?;
+        Ok(resp)
+    }
+
+    /// GET /api/v3/openOrders（signed）—— QUI-108 启动对账收敛复查用，数残留挂单。
+    /// SPOT 要大写 symbol（-1100）。返回 Vec，caller 取 `.len()` 计数。
+    pub async fn get_open_orders(&self, symbol: &str) -> Result<Vec<OpenOrder>, reqwest::Error> {
+        let resp: Vec<OpenOrder> = self
+            .get("/api/v3/openOrders", format!("symbol={}", symbol.to_uppercase()))
+            .await?;
         Ok(resp)
     }
 

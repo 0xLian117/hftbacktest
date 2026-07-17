@@ -294,6 +294,11 @@ where
                     .state
                     .position = qty;
             }
+            LiveEvent::Reconciled { open_orders, .. } => {
+                // QUI-108：连接器完成启动对账（连接期 cancel-all + openOrders 收敛复查）。记录残留
+                // 挂单数，farm 启动 gate 轮询 reconcile_status() 据此放行/拒绝首单。
+                unsafe { self.instruments.get_unchecked_mut(inst_no) }.last_reconcile = Some(open_orders);
+            }
             LiveEvent::Error(error) => {
                 if let Some(handler) = self.error_handler.as_mut() {
                     handler(error)?;
@@ -432,6 +437,13 @@ where
     /// 独立于 depth 的 best_bid()/best_ask()（那两个走 L2 推导）；策略要 freshest BBO 时读这个。
     pub fn bbo(&self, asset_no: usize) -> Option<(f64, f64, f64, f64)> {
         self.instruments.get(asset_no).and_then(|i| i.last_bbo)
+    }
+
+    /// QUI-108：连接器启动对账结果 —— 连接期 cancel-all 扫净 + openOrders 收敛复查后的残留挂单数。
+    /// `None` = 尚未收到对账信号；`Some(0)` = venue 干净可下单；`Some(n>0)` = 扫不净（fail-closed）。
+    /// farm 首单前阻塞轮询此值，把连接器的 cancel-all 串行化在下单之前。
+    pub fn reconcile_status(&self, asset_no: usize) -> Option<u32> {
+        self.instruments.get(asset_no).and_then(|i| i.last_reconcile)
     }
 }
 
