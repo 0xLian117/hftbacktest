@@ -526,22 +526,38 @@ async fn submit_via_rest(
             }
         }
         Err(error) => {
-            if let Some(order) = order_manager
-                .lock()
-                .unwrap()
-                .update_submit_fail(&client_order_id, &error)
-            {
-                tx.send(PublishEvent::LiveEvent(LiveEvent::Order {
-                    symbol: symbol.to_string(),
-                    order,
-                }))
+            // 与 WS 路对称：传输错误（ReqError：POST 后响应丢失/解码失败，订单可能已挂）和
+            // ambiguous 码（-1007 等）执行状态未知 → **绝不终结**（否则孤儿），交 executionReport
+            // 对账。仅确定性拒单（余额/过滤器/精度等业务码）才 Expire。
+            let ambiguous = matches!(&error, BinanceSpotError::ReqError(_))
+                || matches!(
+                    &error,
+                    BinanceSpotError::OrderError { code, .. } if is_ambiguous_order_status(*code)
+                );
+            if ambiguous {
+                warn!(
+                    %client_order_id, ?error,
+                    "REST order submit ambiguous (transport/timeout); NOT terminalizing \
+                    — reconcile via user-stream executionReport."
+                );
+            } else {
+                if let Some(order) = order_manager
+                    .lock()
+                    .unwrap()
+                    .update_submit_fail(&client_order_id, &error)
+                {
+                    tx.send(PublishEvent::LiveEvent(LiveEvent::Order {
+                        symbol: symbol.to_string(),
+                        order,
+                    }))
+                    .unwrap();
+                }
+                tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                    ErrorKind::OrderError,
+                    error.into(),
+                ))))
                 .unwrap();
             }
-            tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
-                ErrorKind::OrderError,
-                error.into(),
-            ))))
-            .unwrap();
         }
     }
 }
