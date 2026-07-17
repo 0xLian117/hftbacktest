@@ -141,16 +141,20 @@ pub enum LiveEvent {
         qty: f64,
         exch_ts: i64,
     },
+    Error(LiveError),
     /// Emitted by a live connector once its startup reconciliation for `symbol` has completed
     /// (cancel-all swept + open orders re-queried to convergence). `open_orders` is the residual
     /// open-order count for the symbol after the sweep; `0` means the venue is clean. A live bot
     /// blocks its first order on this so quoting never races the connector's connect-time
     /// cancel-all. Only produced by the live path — backtest never constructs it.
+    ///
+    /// NOTE: kept as the LAST variant so its bincode ordinal tag is appended, not inserted —
+    /// inserting before `Error` would renumber `Error` and break separately-restarted
+    /// connector/bot processes decoding each other's events across a rolling upgrade.
     Reconciled {
         symbol: String,
         open_orders: u32,
     },
-    Error(LiveError),
 }
 
 /// Indicates a buy, with specific meaning that can vary depending on the situation. For example,

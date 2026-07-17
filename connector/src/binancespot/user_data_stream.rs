@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -47,7 +48,9 @@ pub struct UserDataStream {
     client: BinanceSpotClient,
     ev_tx: UnboundedSender<PublishEvent>,
     order_manager: SharedOrderManager,
-    symbol_rx: Receiver<String>,
+    // QUI-108:reconcile 触发流(每次 register 广播,含重注册)。取代旧的 symbol_rx——本流只做启动对账,
+    // 订阅就绪后按此重跑 sweep+report。market-data 订阅另走 symbol_tx。
+    reconcile_rx: Receiver<String>,
     ws_api: SharedWsApi,
 }
 
@@ -57,7 +60,7 @@ impl UserDataStream {
         ev_tx: UnboundedSender<PublishEvent>,
         order_manager: SharedOrderManager,
         symbols: SharedSymbolSet,
-        symbol_rx: Receiver<String>,
+        reconcile_rx: Receiver<String>,
         ws_api: SharedWsApi,
     ) -> Self {
         Self {
@@ -65,7 +68,7 @@ impl UserDataStream {
             client,
             ev_tx,
             order_manager,
-            symbol_rx,
+            reconcile_rx,
             ws_api,
         }
     }
@@ -127,7 +130,6 @@ impl UserDataStream {
 
         let symbols: HashSet<_> = self.symbols.lock().unwrap().iter().cloned().collect();
         let client = self.client.clone();
-        let order_manager = self.order_manager.clone();
         let ev_tx = self.ev_tx.clone();
         let mut last_ping = Instant::now();
 
@@ -160,26 +162,21 @@ impl UserDataStream {
             .await;
 
         tokio::spawn(async move {
-            // Cancel all orders before connecting to the stream in order to start with the
-            // clean state. QUI-108：每 symbol 撤净 + openOrders 收敛复查 + 发 Reconciled 信号
-            // （farm 首单 gate 阻塞于此，把 cancel-all 串行化到下单前）。
-            for symbol in &symbols {
-                sweep_and_report(
-                    client.clone(),
-                    symbol.clone(),
-                    order_manager.clone(),
-                    ev_tx.clone(),
-                )
-                .await;
-            }
-
-            // Fetches the initial states such as positions and open orders.
+            // Fetches the initial states such as positions and open orders (per-asset balances).
+            // QUI-108:cancel_all + Reconciled 信号**不在此**发——移到订阅(executionReport 通道)就绪后
+            // (见下方 SubscribeResponse / reconcile_rx),否则可能在 exec 通道 live 前放行 farm → 漏 fill。
             if let Err(error) =
                 get_position_information(client.clone(), symbols, ev_tx.clone()).await
             {
                 error!(?error, "Couldn't get position information.");
             }
         });
+
+        // QUI-108 启动对账状态:订阅(executionReport 通道)就绪前不发 Reconciled(P0)。就绪时对每个已注册
+        // symbol 跑一次 reconcile;之后 reconcile_rx 的每次触发(farm 重启重注册)也逐个响应(P1#2)。inflight
+        // 去重防同一 symbol 并发 sweep(订阅快照 + reconcile_rx 同时命中)提前放行 gate(P1#3)。
+        let mut subscribed = false;
+        let inflight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         loop {
             select! {
@@ -207,24 +204,26 @@ impl UserDataStream {
                     }
                     // None: 所有 sender 已 drop（本循环仍持有 cmd_tx，故循环存活期不会发生）。
                 }
-                msg = self.symbol_rx.recv() => {
+                msg = self.reconcile_rx.recv() => {
                     match msg {
                         Ok(symbol) => {
-                            let client = self.client.clone();
-                            let order_manager = self.order_manager.clone();
-                            let ev_tx = self.ev_tx.clone();
-
-                            // QUI-108 CRITICAL：late 注册路径也必须发 Reconciled。连接器先连、bot 后
-                            // 注册（systemd 常见）时,该 symbol 只走此路;漏发 → farm gate 超时 crash-loop。
-                            tokio::spawn(async move {
-                                sweep_and_report(client, symbol, order_manager, ev_tx).await;
-                            });
+                            // reconcile 触发(每次 register 广播,含 farm 重启的重注册)。仅在订阅就绪后动作
+                            // (P0);未就绪时忽略——该 symbol 已在 self.symbols,订阅成功时统一 reconcile。
+                            if subscribed {
+                                spawn_reconcile(
+                                    inflight.clone(),
+                                    self.client.clone(),
+                                    symbol,
+                                    self.order_manager.clone(),
+                                    self.ev_tx.clone(),
+                                );
+                            }
                         }
                         Err(RecvError::Closed) => {
                             return Ok(());
                         }
                         Err(RecvError::Lagged(num)) => {
-                            error!("{num} subscription requests were missed.");
+                            error!("{num} reconcile triggers were missed.");
                         }
                     }
                 }
@@ -277,6 +276,21 @@ impl UserDataStream {
                                     // 保证任何经 WS 下的单都有对账通道（超时/ambiguous 单靠它对账）。
                                     *self.ws_api.lock().unwrap() =
                                         Some(WsApiHandle { cmd_tx: cmd_tx.clone() });
+                                    // QUI-108:通道就绪后才跑启动对账(cancel_all + openOrders 收敛 + 发
+                                    // Reconciled)。对当前所有已注册 symbol 各跑一次;inflight 去重(reconcile_rx
+                                    // 可能同时命中同一 symbol)。之后重注册经 reconcile_rx 分支响应。
+                                    subscribed = true;
+                                    let registered: Vec<String> =
+                                        self.symbols.lock().unwrap().iter().cloned().collect();
+                                    for symbol in registered {
+                                        spawn_reconcile(
+                                            inflight.clone(),
+                                            self.client.clone(),
+                                            symbol,
+                                            self.order_manager.clone(),
+                                            self.ev_tx.clone(),
+                                        );
+                                    }
                                 } else {
                                     error!(?resp, "userDataStream.subscribe failed; reconnecting.");
                                     return Err(BinanceSpotError::ConnectionInterrupted);
@@ -331,16 +345,36 @@ pub async fn cancel_all(
     Ok(())
 }
 
-/// QUI-108 启动对账（per symbol）：连接期 `cancel_all` 扫净 → openOrders 收敛复查 → 发
+/// QUI-108:去重地 spawn 一次 per-symbol reconcile。`inflight` 集合防同一 symbol 并发 sweep——
+/// 订阅成功时对快照全量 spawn,同一时刻 reconcile_rx 可能也命中同一 symbol;两个 sweep 并发时,一个
+/// 的 DELETE 未落地另一个已 emit `Reconciled(0)` → gate 提前放行(P1#3)。已在 reconcile 中 → 跳过。
+fn spawn_reconcile(
+    inflight: Arc<Mutex<HashSet<String>>>,
+    client: BinanceSpotClient,
+    symbol: String,
+    order_manager: SharedOrderManager,
+    ev_tx: UnboundedSender<PublishEvent>,
+) {
+    if !inflight.lock().unwrap().insert(symbol.clone()) {
+        return; // 该 symbol 的 reconcile 已在进行 → 不重复 spawn
+    }
+    tokio::spawn(async move {
+        sweep_and_report(client, symbol.clone(), order_manager, ev_tx).await;
+        inflight.lock().unwrap().remove(&symbol);
+    });
+}
+
+/// QUI-108 启动对账（per symbol）：`cancel_all` 扫净 → openOrders 收敛复查 → 发
 /// `LiveEvent::Reconciled { symbol, open_orders }`。farm 首单 gate 阻塞轮询 `reconcile_status`,
 /// 据此把连接器的 cancel-all 串行化到下单之前（解 QUI-109 r3 cancel_all-vs-新单竞态）。
 ///
-/// **两条注册路径都必须调用它**（初始 spawn 快照 + late `symbol_rx` 分支）——连接器是独立进程,
-/// 与 bot 的 RegisterInstrument 有启动竞态,漏任一路 → 该 symbol 永不发信号 → farm gate 超时 crash-loop。
+/// **仅在 executionReport 订阅就绪后**由 `spawn_reconcile` 触发（订阅成功时对已注册 symbol 全量 +
+/// 之后每次 register 经 reconcile_rx）——保证 Reconciled(=可下单) 时对账通道已 live,不漏补发单的 fill；
+/// 且 farm 重启撞存活 connector 也能经重注册拿到新信号（P0/P1#2）。
 ///
 /// **fail-closed**:cancel_all 失败不阻断(仍复查+发信号,count 反映真实残留);openOrders 复查
 /// 全部失败 → 发 `u32::MAX` 哨兵 → farm loud-exit(绝不 default 0 假 clean)。
-pub async fn sweep_and_report(
+async fn sweep_and_report(
     client: BinanceSpotClient,
     symbol: String,
     order_manager: SharedOrderManager,

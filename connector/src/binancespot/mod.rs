@@ -131,6 +131,10 @@ pub struct BinanceSpot {
     order_manager: SharedOrderManager,
     client: BinanceSpotClient,
     symbol_tx: Sender<String>,
+    // QUI-108 启动对账触发通道:与 symbol_tx(去重、驱动 market-data 订阅)分开——register() 对**每次**
+    // 注册(含已注册 symbol 的重注册)都在此广播,让 user_data_stream 在**订阅就绪后**对该 symbol 重跑
+    // reconcile 并发 Reconciled。这样 farm 重启撞存活 connector(symbol 已注册、连接未断)也能拿到信号。
+    reconcile_tx: Sender<String>,
     // ws-api 下单 session slot：None = 未 logon（下单走 REST），Some = 可走 WS。由 user_data_stream
     // 的 connect() 在 session.logon 成功后填入，退出时 ClearOnDrop 清回 None。
     ws_api: SharedWsApi,
@@ -177,7 +181,7 @@ impl BinanceSpot {
         let client = self.client.clone();
         let order_manager = self.order_manager.clone();
         let instruments = self.symbols.clone();
-        let symbol_tx = self.symbol_tx.clone();
+        let reconcile_tx = self.reconcile_tx.clone();
         let ws_api = self.ws_api.clone();
 
         tokio::spawn(async move {
@@ -201,7 +205,7 @@ impl BinanceSpot {
                         ev_tx.clone(),
                         order_manager.clone(),
                         instruments.clone(),
-                        symbol_tx.subscribe(),
+                        reconcile_tx.subscribe(),
                         ws_api.clone(),
                     );
 
@@ -227,6 +231,7 @@ impl ConnectorBuilder for BinanceSpot {
         let order_manager = Arc::new(Mutex::new(OrderManager::new(&config.order_prefix)));
         let client = BinanceSpotClient::new(&config.api_url, &config.api_key, &config.secret);
         let (symbol_tx, _) = broadcast::channel(500);
+        let (reconcile_tx, _) = broadcast::channel(500);
 
         Ok(BinanceSpot {
             config,
@@ -234,6 +239,7 @@ impl ConnectorBuilder for BinanceSpot {
             order_manager,
             client,
             symbol_tx,
+            reconcile_tx,
             ws_api: Arc::new(Mutex::new(None)),
         })
     }
@@ -246,11 +252,18 @@ impl Connector for BinanceSpot {
             error!("Binance Futures symbol must be lowercase.");
         }
         let symbol = symbol.to_lowercase();
-        let mut symbols = self.symbols.lock().unwrap();
-        if !symbols.contains(&symbol) {
-            symbols.insert(symbol.clone());
-            self.symbol_tx.send(symbol).unwrap();
+        {
+            let mut symbols = self.symbols.lock().unwrap();
+            if !symbols.contains(&symbol) {
+                symbols.insert(symbol.clone());
+                self.symbol_tx.send(symbol.clone()).unwrap(); // market-data 订阅:去重(只首次)
+            }
         }
+        // QUI-108:reconcile 触发对**每次** register 都广播(含重注册)。farm 重启会重发 RegisterInstrument;
+        // 若 connector 存活、symbol 已注册,symbol_tx 去重 → 不重发,但 user_data_stream 需据此重跑对账并发
+        // Reconciled,否则 farm gate 永远等不到信号 → crash-loop。无接收者(user-stream 未连)时 send 返
+        // Err,忽略——连接期 self.symbols 快照会覆盖这些 symbol。
+        let _ = self.reconcile_tx.send(symbol);
     }
 
     fn order_manager(&self) -> Arc<Mutex<dyn GetOrders + Send + 'static>> {
