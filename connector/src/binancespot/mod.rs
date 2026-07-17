@@ -38,10 +38,19 @@ use crate::{
     utils::{ExponentialBackoff, Retry, generate_rand_string, get_timestamp},
 };
 
-/// ws-api 下/撤单的 fallback 触发阈值（非正常路延迟）：超过则落 REST。远短于重连 backoff，
-/// 死 socket 快速 fallback。⚠️ 到 500ms 时该单 event2order 已远超盈利门（MEM ~5ms）→ 补发的
-/// REST 单在 fresh 语义上已失效；连接器只保证「不双单」，弃单交上层 latency guard（QUI-110）。
+/// ws-api 下/撤单的响应等待阈值：超过则视为「未确认」。远短于重连 backoff，死 socket 快速判定。
+/// ⚠️ 到 500ms 时该单 event2order 已远超盈利门（MEM ~5ms）→ 即使随后确认也已失 fresh；是否弃单
+/// 交上层 latency guard（QUI-110）。超时**不触发 REST 重发**（见 submit 内注释：重发不安全）。
 const WS_API_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Binance 服务端「执行状态未知」类错误码：请求**可能已被处理**（订单可能已在挂）。对这些码
+/// **绝不终结订单**（不 Expire、不解绑 id_map）——否则会把实际 resting 的单变孤儿；交由 user-stream
+/// executionReport 对账。其余业务拒单码（-2010 余额/越过、-1013 过滤器、-1111 精度等）是**确定性
+/// 拒绝**（订单未下），可安全走 update_submit_fail → Expire。
+/// -1000 UNKNOWN · -1001 DISCONNECTED · -1006 UNEXPECTED_RESP · -1007 TIMEOUT（"可能但不确定已处理"）。
+fn is_ambiguous_order_status(code: i64) -> bool {
+    matches!(code, -1000 | -1001 | -1006 | -1007)
+}
 
 #[derive(Error, Debug)]
 pub enum BinanceSpotError {
@@ -352,19 +361,33 @@ impl Connector for BinanceSpot {
                     }
                 }
                 Ok(Ok(WsApiOrderResult::Err(error))) => {
-                    if let Some(order) = order_manager
-                        .lock()
-                        .unwrap()
-                        .update_submit_fail(&client_order_id, &error)
-                    {
-                        tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
-                            .unwrap();
+                    // 执行状态未知的码（-1007 超时等）：订单可能已在挂 → 绝不终结（否则孤儿），
+                    // 交给 executionReport 对账。仅确定性拒单才 Expire。
+                    let ambiguous = matches!(
+                        &error,
+                        BinanceSpotError::OrderError { code, .. } if is_ambiguous_order_status(*code)
+                    );
+                    if ambiguous {
+                        warn!(
+                            %client_order_id, ?error,
+                            "ws-api order.place returned ambiguous status; NOT terminalizing \
+                            — reconcile via user-stream executionReport."
+                        );
+                    } else {
+                        if let Some(order) = order_manager
+                            .lock()
+                            .unwrap()
+                            .update_submit_fail(&client_order_id, &error)
+                        {
+                            tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
+                                .unwrap();
+                        }
+                        tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                            ErrorKind::OrderError,
+                            error.into(),
+                        ))))
+                        .unwrap();
                     }
-                    tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
-                        ErrorKind::OrderError,
-                        error.into(),
-                    ))))
-                    .unwrap();
                 }
                 // 超时（Err(Elapsed)）或 session 中途掉线（Ok(Err(Canceled)））：该单可能已送达并 resting。
                 // 绝不 REST 重发（见上）；交给 executionReport 对账。
