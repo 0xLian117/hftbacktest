@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -9,7 +9,8 @@ use tokio::{
     select,
     sync::{
         broadcast::{Receiver, error::RecvError},
-        mpsc::UnboundedSender,
+        mpsc::{self, UnboundedSender},
+        oneshot,
     },
     time,
 };
@@ -23,15 +24,19 @@ use crate::{
     binancespot::{
         BinanceSpotError,
         SharedSymbolSet,
-        msg::stream::{
-            SignParams,
-            SignRequest,
-            UserEventStream,
-            UserStream,
-            UserStreamSubscribeRequest,
+        msg::{
+            stream::{
+                SignParams,
+                SignRequest,
+                UserEventStream,
+                UserStream,
+                UserStreamSubscribeRequest,
+            },
+            wsapi::{WsApiOrderResponse, WsApiOrderResult},
         },
         ordermanager::SharedOrderManager,
         rest::BinanceSpotClient,
+        wsapi::{ClearOnDrop, SharedWsApi, WsApiCommand, WsApiHandle, ws_api_response_id},
     },
     connector::PublishEvent,
     utils::{generate_rand_string, get_timestamp, sign_ed25519},
@@ -43,6 +48,7 @@ pub struct UserDataStream {
     ev_tx: UnboundedSender<PublishEvent>,
     order_manager: SharedOrderManager,
     symbol_rx: Receiver<String>,
+    ws_api: SharedWsApi,
 }
 
 impl UserDataStream {
@@ -52,6 +58,7 @@ impl UserDataStream {
         order_manager: SharedOrderManager,
         symbols: SharedSymbolSet,
         symbol_rx: Receiver<String>,
+        ws_api: SharedWsApi,
     ) -> Self {
         Self {
             symbols,
@@ -59,6 +66,7 @@ impl UserDataStream {
             ev_tx,
             order_manager,
             symbol_rx,
+            ws_api,
         }
     }
 
@@ -123,6 +131,13 @@ impl UserDataStream {
         let ev_tx = self.ev_tx.clone();
         let mut last_ping = Instant::now();
 
+        // ws-api 下单通道：本循环是唯一 writer；submit/cancel 经 cmd_rx 汇入，响应按 id 关联回
+        // pending 里各自的 oneshot。ClearOnDrop 覆盖所有退出路径：清 shared slot（新单直接 REST）；
+        // 循环返回时 pending 自动析构 → 在飞请求的 oneshot 全 Canceled → 各 caller 落 REST。
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WsApiCommand>();
+        let mut pending: HashMap<String, oneshot::Sender<WsApiOrderResult>> = HashMap::new();
+        let _clear_ws_api = ClearOnDrop(self.ws_api.clone());
+
         let mut req = SignRequest {
             id: generate_rand_string(16),
             method: "session.logon".to_string(),
@@ -176,6 +191,15 @@ impl UserDataStream {
                         return Err(BinanceSpotError::ConnectionInterrupted);
                     }
                 }
+                cmd = cmd_rx.recv() => {
+                    if let Some(cmd) = cmd {
+                        // 先登记 pending 再发；write 失败则 return（触发重连），pending 随之析构
+                        // → 该单 oneshot Canceled → caller 落 REST。
+                        pending.insert(cmd.id, cmd.resp_tx);
+                        write.send(Message::Text(cmd.text.into())).await?;
+                    }
+                    // None: 所有 sender 已 drop（本循环仍持有 cmd_tx，故循环存活期不会发生）。
+                }
                 msg = self.symbol_rx.recv() => {
                     match msg {
                         Ok(symbol) => {
@@ -204,6 +228,24 @@ impl UserDataStream {
                 }
                 message = read.next() => match message {
                     Some(Ok(Message::Text(text))) => {
+                        // ws-api 下/撤单响应优先：顶层 id 命中 pending → 解 WsApiOrderResponse 路由回
+                        // caller。未命中（logon/subscribe 响应、executionReport wrapper 无顶层 id）→
+                        // fall through 到 UserStream 匹配（R3 消歧：logon/subscribe id 从不进 pending）。
+                        if let Some(id) = ws_api_response_id(&text, &pending) {
+                            match serde_json::from_str::<WsApiOrderResponse>(&text) {
+                                Ok(resp) => {
+                                    if let Some(resp_tx) = pending.remove(&id) {
+                                        let _ = resp_tx.send(resp.into_result());
+                                    }
+                                }
+                                Err(error) => {
+                                    error!(?error, %text, "Couldn't parse ws-api order response.");
+                                    // 丢弃 pending 条目 → oneshot Canceled → caller 落 REST。
+                                    pending.remove(&id);
+                                }
+                            }
+                            continue;
+                        }
                         match serde_json::from_str::<UserStream>(&text) {
                             Ok(UserStream::EventStream(stream)) => {
                                 self.process_message(stream.event)?;
@@ -218,6 +260,9 @@ impl UserDataStream {
                                         })
                                         .unwrap().into(),
                                     )).await?;
+                                    // logon 成功 → ws-api 下单可用：填 shared slot，submit/cancel 从此走 WS。
+                                    *self.ws_api.lock().unwrap() =
+                                        Some(WsApiHandle { cmd_tx: cmd_tx.clone() });
                                 }
                             }
                             Ok(UserStream::SubscribeResponse(resp)) => {
