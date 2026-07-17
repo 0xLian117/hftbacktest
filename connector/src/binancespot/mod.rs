@@ -283,86 +283,99 @@ impl Connector for BinanceSpot {
                 }
             };
 
-            // ws-api 优先：session up 则走 WS，超时/断线落 REST（同 client_order_id → R1：
-            // Binance 拒重复 coid，最坏一单 + 一条无害 dup error）。
+            // ws-api 优先。**下单幂等由设计保证，不靠交易所去重**：REST 只在该单「从未经 WS 发出」
+            // 时才用（slot=None，或命令未送达 actor）。一旦 WS 已发出后超时/掉线，**绝不 REST 重发**
+            // ——因为 Binance 在订单成交/离场后允许复用 clientOrderId，盲发同 coid 会双单（已成交时）
+            // 或把实际在挂的单误标 Expired 成孤儿（仍 resting 时）。此时交由 user-stream executionReport
+            // 对账：真 resting → NEW report 更新并 emit；真丢失 → 该单留在 OMS 由 strategy 撤单 / 重连
+            // cancel_all 自愈（上层 submit-timeout 也会 fail-close，QUI-107）。
             let handle = ws_api.lock().unwrap().clone();
-            if let Some(handle) = handle {
-                let price = order.price_tick as f64 * order.tick_size;
-                let price_prec = get_precision(order.tick_size);
-                let side: &str = order.side.as_ref();
-                // GTX → LIMIT_MAKER（无 timeInForce），镜像 rest.rs / submit_order。
-                let (order_type, time_in_force): (String, Option<String>) =
-                    if matches!(order.time_in_force, TimeInForce::GTX) {
-                        ("LIMIT_MAKER".to_string(), None)
-                    } else {
-                        let ot: &str = order.order_type.as_ref();
-                        let tif: &str = order.time_in_force.as_ref();
-                        (ot.to_string(), Some(tif.to_string()))
-                    };
-                let id = generate_rand_string(16);
-                let req = WsApiRequest {
-                    id: id.clone(),
-                    method: "order.place".to_string(),
-                    params: OrderPlaceParams {
-                        symbol: symbol.to_uppercase(), // SPOT 要大写(-1100)
-                        side: side.to_string(),
-                        order_type,
-                        time_in_force,
-                        quantity: format!("{:.5}", order.qty),
-                        price: format!("{price:.price_prec$}"),
-                        new_client_order_id: client_order_id.clone(),
-                        new_order_resp_type: "FULL".to_string(),
-                        timestamp: get_timestamp(),
-                    },
-                };
-                let text = serde_json::to_string(&req).unwrap();
-                let (resp_tx, resp_rx) = oneshot::channel();
-                if handle
-                    .cmd_tx
-                    .send(WsApiCommand { id, text, resp_tx })
-                    .is_ok()
-                {
-                    match timeout(WS_API_TIMEOUT, resp_rx).await {
-                        Ok(Ok(WsApiOrderResult::Ok(resp))) => {
-                            if let Some(order) = order_manager
-                                .lock()
-                                .unwrap()
-                                .update_from_rest(&client_order_id, &resp)
-                            {
-                                tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
-                                    .unwrap();
-                            }
-                            return;
-                        }
-                        Ok(Ok(WsApiOrderResult::Err(error))) => {
-                            if let Some(order) = order_manager
-                                .lock()
-                                .unwrap()
-                                .update_submit_fail(&client_order_id, &error)
-                            {
-                                tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
-                                    .unwrap();
-                            }
-                            tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
-                                ErrorKind::OrderError,
-                                error.into(),
-                            ))))
-                            .unwrap();
-                            return;
-                        }
-                        // timeout（Err(Elapsed)）或 session 中途掉线（Ok(Err(Canceled)））→ 落 REST。
-                        _ => {
-                            warn!(
-                                %client_order_id,
-                                "ws-api order.place timed out or session dropped; falling back to REST."
-                            );
-                        }
-                    }
+            let handle = match handle {
+                Some(h) => h,
+                // ws-api 未就绪：该单从未经 WS 发出 → REST 单通道下单，安全。
+                None => {
+                    submit_via_rest(&client, &order_manager, &symbol, client_order_id, order, &tx)
+                        .await;
+                    return;
                 }
-                // cmd_tx.send 失败（循环已退出）→ 落 REST。
+            };
+
+            let price = order.price_tick as f64 * order.tick_size;
+            let price_prec = get_precision(order.tick_size);
+            let side: &str = order.side.as_ref();
+            // GTX → LIMIT_MAKER（无 timeInForce），镜像 rest.rs / submit_order。
+            let (order_type, time_in_force): (String, Option<String>) =
+                if matches!(order.time_in_force, TimeInForce::GTX) {
+                    ("LIMIT_MAKER".to_string(), None)
+                } else {
+                    let ot: &str = order.order_type.as_ref();
+                    let tif: &str = order.time_in_force.as_ref();
+                    (ot.to_string(), Some(tif.to_string()))
+                };
+            let id = generate_rand_string(16);
+            let req = WsApiRequest {
+                id: id.clone(),
+                method: "order.place".to_string(),
+                params: OrderPlaceParams {
+                    symbol: symbol.to_uppercase(), // SPOT 要大写(-1100)
+                    side: side.to_string(),
+                    order_type,
+                    time_in_force,
+                    quantity: format!("{:.5}", order.qty),
+                    price: format!("{price:.price_prec$}"),
+                    new_client_order_id: client_order_id.clone(),
+                    new_order_resp_type: "FULL".to_string(),
+                    timestamp: get_timestamp(),
+                },
+            };
+            let text = serde_json::to_string(&req).unwrap();
+            let (resp_tx, resp_rx) = oneshot::channel();
+            if handle
+                .cmd_tx
+                .send(WsApiCommand { id, text, resp_tx })
+                .is_err()
+            {
+                // actor 已退出（cmd_rx dropped）→ 命令未送达 → 该单从未经 WS 发出 → REST 安全。
+                submit_via_rest(&client, &order_manager, &symbol, client_order_id, order, &tx).await;
+                return;
             }
 
-            submit_via_rest(&client, &order_manager, &symbol, client_order_id, order, &tx).await;
+            match timeout(WS_API_TIMEOUT, resp_rx).await {
+                Ok(Ok(WsApiOrderResult::Ok(resp))) => {
+                    if let Some(order) = order_manager
+                        .lock()
+                        .unwrap()
+                        .update_from_rest(&client_order_id, &resp)
+                    {
+                        tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
+                            .unwrap();
+                    }
+                }
+                Ok(Ok(WsApiOrderResult::Err(error))) => {
+                    if let Some(order) = order_manager
+                        .lock()
+                        .unwrap()
+                        .update_submit_fail(&client_order_id, &error)
+                    {
+                        tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
+                            .unwrap();
+                    }
+                    tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                        ErrorKind::OrderError,
+                        error.into(),
+                    ))))
+                    .unwrap();
+                }
+                // 超时（Err(Elapsed)）或 session 中途掉线（Ok(Err(Canceled)））：该单可能已送达并 resting。
+                // 绝不 REST 重发（见上）；交给 executionReport 对账。
+                _ => {
+                    warn!(
+                        %client_order_id,
+                        "ws-api order.place unconfirmed (timeout/disconnect); NOT re-placing via REST \
+                        — reconcile via user-stream executionReport."
+                    );
+                }
+            }
         });
     }
 

@@ -190,6 +190,10 @@ impl UserDataStream {
                         warn!("Ping timeout.");
                         return Err(BinanceSpotError::ConnectionInterrupted);
                     }
+                    // 清理已超时的在飞请求：caller 超时后 drop 了 receiver（is_closed），其 sender 若
+                    // 留在 pending（响应始终未到）会在长连接上无界累积。每 10s 扫一次兜底（正常路径下
+                    // 响应到达时即被 remove）。
+                    pending.retain(|_, resp_tx| !resp_tx.is_closed());
                 }
                 cmd = cmd_rx.recv() => {
                     if let Some(cmd) = cmd {
