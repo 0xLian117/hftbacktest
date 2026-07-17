@@ -9,6 +9,8 @@ use serde::{
 pub mod rest;
 #[allow(dead_code)]
 pub mod stream;
+#[allow(dead_code)]
+pub mod wsapi;
 
 fn from_str_to_side<'de, D>(deserializer: D) -> Result<Side, D::Error>
 where
