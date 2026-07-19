@@ -275,7 +275,17 @@ where
                                 || ex_order.status == Status::Expired
                                 || ex_order.status == Status::Filled
                             {
-                                // Ignores the update since the current status is the final status.
+                                // QUI-114: don't blanket-ignore once terminal. If a late fill (a cancel/fill
+                                // race's final execution) raises the cumulative fill (qty - leaves_qty),
+                                // correct only the fill-accounting fields so downstream can true up the
+                                // position, but KEEP the terminal status/req (never reopen the order). Do not
+                                // touch exec_qty (downstream uses qty - leaves_qty; exec_qty is last-fill-only).
+                                let ex_cum = ex_order.qty - ex_order.leaves_qty;
+                                let in_cum = order.qty - order.leaves_qty;
+                                if in_cum > ex_cum + 1e-12 {
+                                    ex_order.leaves_qty = order.leaves_qty;
+                                    ex_order.qty = order.qty;
+                                }
                             } else {
                                 ex_order.update(&order);
                             }

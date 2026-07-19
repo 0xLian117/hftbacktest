@@ -55,6 +55,9 @@ impl OrderManager {
             .ok_or(BinanceSpotError::OrderNotFound)?;
 
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
+        // QUI-114:累计成交权威 = qty − leaves_qty(不用 exec_qty:WS 路是「最后一笔」量)。记更新前累计,
+        // 用于判「迟到的更高累计成交」。
+        let old_cum = order_ext.order.qty - order_ext.order.leaves_qty;
         if resp.event_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = resp.quantity;
             order_ext.order.leaves_qty = resp.quantity - resp.order_filled_accumulated_quantity;
@@ -68,10 +71,14 @@ impl OrderManager {
             order_ext.order.order_type = resp.order_type;
         }
 
-        let result = if already_removed {
-            None
-        } else {
+        // QUI-114:即便另一源已把该单标终态(already_removed),若本次**累计成交增加**(cancel 竞态里迟到的
+        // 最终 fill)仍**发布纠正** → bot/OMS 据此补仓、不重开单。result 在下方 orders.remove 之前算好,故
+        // 纠正先发布再删除,无需保留窗口。累计不增 = 冗余/stale → None。
+        let new_cum = order_ext.order.qty - order_ext.order.leaves_qty;
+        let result = if !already_removed || new_cum > old_cum + 1e-12 {
             Some(order_ext.order.clone())
+        } else {
+            None
         };
 
         if order_ext.order.status != Status::New
@@ -190,6 +197,7 @@ impl OrderManager {
         // .ok_or(BinanceFuturesError::OrderNotFound)?;
 
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
+        let old_cum = order_ext.order.qty - order_ext.order.leaves_qty; // QUI-114 累计 = qty−leaves
         if resp.transact_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = resp.orig_qty;
             order_ext.order.leaves_qty = resp.orig_qty - resp.executed_qty;
@@ -204,10 +212,12 @@ impl OrderManager {
             order_ext.order.req = Status::None;
         }
 
-        let result = if already_removed {
-            None
-        } else {
+        // QUI-114:已终态后累计成交增加(迟到 fill)仍发布纠正(先发布再删除,见 update_from_ws 注释)。
+        let new_cum = order_ext.order.qty - order_ext.order.leaves_qty;
+        let result = if !already_removed || new_cum > old_cum + 1e-12 {
             Some(order_ext.order.clone())
+        } else {
+            None
         };
 
         if order_ext.order.status != Status::New

@@ -69,6 +69,8 @@ impl OrderManager {
             .ok_or(BinanceFuturesError::OrderNotFound)?;
 
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
+        // QUI-114 累计成交权威 = qty − leaves_qty(不用 exec_qty:WS 是「最后一笔」量)。
+        let old_cum = order_ext.order.qty - order_ext.order.leaves_qty;
         if resp.transaction_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = resp.order.original_qty;
             order_ext.order.leaves_qty =
@@ -83,10 +85,13 @@ impl OrderManager {
             order_ext.order.order_type = resp.order.order_type;
         }
 
-        let result = if already_removed {
-            None
-        } else {
+        // QUI-114:已终态后累计成交增加(迟到 fill)仍发布纠正(先算 result 再 orders.remove,故先发布再删除,
+        // 无需保留窗口)。bot/OMS 据此补仓、不重开单。累计不增 = 冗余/stale → None。
+        let new_cum = order_ext.order.qty - order_ext.order.leaves_qty;
+        let result = if !already_removed || new_cum > old_cum + 1e-12 {
             Some(order_ext.order.clone())
+        } else {
+            None
         };
 
         if order_ext.order.status != Status::New
@@ -205,6 +210,7 @@ impl OrderManager {
         // .ok_or(BinanceFuturesError::OrderNotFound)?;
 
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
+        let old_cum = order_ext.order.qty - order_ext.order.leaves_qty; // QUI-114 累计 = qty−leaves
         if resp.update_time * 1_000_000 >= order_ext.order.exch_timestamp {
             order_ext.order.qty = resp.orig_qty;
             order_ext.order.leaves_qty = resp.orig_qty - resp.cum_qty;
@@ -219,10 +225,12 @@ impl OrderManager {
             order_ext.order.req = Status::None;
         }
 
-        let result = if already_removed {
-            None
-        } else {
+        // QUI-114:已终态后累计成交增加(迟到 fill)仍发布纠正(先发布再删除)。
+        let new_cum = order_ext.order.qty - order_ext.order.leaves_qty;
+        let result = if !already_removed || new_cum > old_cum + 1e-12 {
             Some(order_ext.order.clone())
+        } else {
+            None
         };
 
         if order_ext.order.status != Status::New
