@@ -72,9 +72,6 @@ impl OrderManager {
         // QUI-114 累计成交权威 = qty − leaves_qty(不用 exec_qty:WS 是「最后一笔」量)。
         let old_cum = order_ext.order.qty - order_ext.order.leaves_qty;
         if resp.transaction_time * 1_000_000 >= order_ext.order.exch_timestamp {
-            order_ext.order.qty = resp.order.original_qty;
-            order_ext.order.leaves_qty =
-                resp.order.original_qty - resp.order.order_filled_accumulated_qty;
             order_ext.order.side = resp.order.side;
             order_ext.order.time_in_force = resp.order.time_in_force;
             order_ext.order.exch_timestamp = resp.transaction_time * 1_000_000;
@@ -83,6 +80,15 @@ impl OrderManager {
                 (resp.order.last_filled_price / order_ext.order.tick_size).round() as i64;
             order_ext.order.exec_qty = resp.order.order_last_filled_qty;
             order_ext.order.order_type = resp.order.order_type;
+        }
+        // QUI-114 P0:累计成交单调合并,**独立于 transaction_time**。乱序到达的 fill(ts 更旧但累计更高)
+        // = 真实迟到成交,绝不能被 ts 门控丢弃;ts 只门控 status/价格等元数据。
+        if resp.order.order_filled_accumulated_qty
+            > order_ext.order.qty - order_ext.order.leaves_qty + 1e-12
+        {
+            order_ext.order.qty = resp.order.original_qty;
+            order_ext.order.leaves_qty =
+                resp.order.original_qty - resp.order.order_filled_accumulated_qty;
         }
 
         // QUI-114:已终态后累计成交增加(迟到 fill)仍发布纠正(先算 result 再 orders.remove,故先发布再删除,
@@ -212,8 +218,6 @@ impl OrderManager {
         let already_removed = order_ext.removed_by_ws || order_ext.removed_by_rest;
         let old_cum = order_ext.order.qty - order_ext.order.leaves_qty; // QUI-114 累计 = qty−leaves
         if resp.update_time * 1_000_000 >= order_ext.order.exch_timestamp {
-            order_ext.order.qty = resp.orig_qty;
-            order_ext.order.leaves_qty = resp.orig_qty - resp.cum_qty;
             order_ext.order.side = resp.side;
             order_ext.order.time_in_force = resp.time_in_force;
             order_ext.order.exch_timestamp = resp.update_time * 1_000_000;
@@ -223,6 +227,12 @@ impl OrderManager {
             order_ext.order.exec_qty = resp.executed_qty;
             order_ext.order.order_type = resp.ty;
             order_ext.order.req = Status::None;
+        }
+        // QUI-114 P0:累计成交单调合并,独立于 REST update_time(乱序 REST 快照的 cum_qty 更高即真实
+        // 迟到成交)。ts 只门控 status/元数据。
+        if resp.cum_qty > order_ext.order.qty - order_ext.order.leaves_qty + 1e-12 {
+            order_ext.order.qty = resp.orig_qty;
+            order_ext.order.leaves_qty = resp.orig_qty - resp.cum_qty;
         }
 
         // QUI-114:已终态后累计成交增加(迟到 fill)仍发布纠正(先发布再删除)。
