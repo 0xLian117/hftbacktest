@@ -141,6 +141,7 @@ impl BinanceSpot {
         let base_url = self.config.stream_url.clone();
         let client = self.client.clone();
         let symbol_tx = self.symbol_tx.clone();
+        let symbols = self.symbols.clone(); // QUI-113:MD stream 重连重订阅用(register() 维护的权威 set,只多一 reader)
 
         tokio::spawn(async move {
             let _ = Retry::new(ExponentialBackoff::default())
@@ -162,6 +163,7 @@ impl BinanceSpot {
                         client.clone(),
                         ev_tx.clone(),
                         symbol_tx.subscribe(),
+                        symbols.clone(),
                     );
                     debug!("Connecting to the market data stream...");
                     stream.connect(&base_url).await?;

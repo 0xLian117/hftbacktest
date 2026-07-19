@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -47,6 +48,10 @@ pub struct MarketDataStream {
     client: BinanceSpotClient,
     ev_tx: UnboundedSender<PublishEvent>,
     symbol_rx: Receiver<String>,
+    // QUI-113：重连须重放已注册 symbol。broadcast `symbol_rx` 只送**订阅之后**的注册,重连新建的 stream
+    // 拿到的新 Receiver 收不到过去广播的 symbol → 不重放就会重连后静默失订阅、在死盘口报价。connect() 用此
+    // 权威 set 重订阅全部(register() 在 mod.rs 维护)。镜像 binancefutures/market_data_stream.rs。
+    symbols: Arc<Mutex<HashSet<String>>>,
     depth_sync: HashMap<String, DepthSync>,
     resync_count: HashMap<String, u64>,
     rest_tx: UnboundedSender<(String, rest::Depth)>,
@@ -58,12 +63,14 @@ impl MarketDataStream {
         client: BinanceSpotClient,
         ev_tx: UnboundedSender<PublishEvent>,
         symbol_rx: Receiver<String>,
+        symbols: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         let (rest_tx, rest_rx) = unbounded_channel::<(String, rest::Depth)>();
         Self {
             client,
             ev_tx,
             symbol_rx,
+            symbols,
             depth_sync: Default::default(),
             resync_count: Default::default(),
             rest_tx,
@@ -329,6 +336,24 @@ impl MarketDataStream {
         let (mut write, mut read) = ws_stream.split();
         let mut ping_checker = time::interval(Duration::from_secs(10));
         let mut last_ping = Instant::now();
+
+        // QUI-113：(重)连时重订阅全部已注册 symbol。新 stream 的 broadcast Receiver 收不到过去的注册,
+        // 不重放会重连后静默失订阅 → 死盘口报价。先 collect 释锁再 await(锁不跨 await)。新 stream 的
+        // depth_sync 为空 → 首条 diff 触发 request_snapshot → process_snapshot 先 CLEAR 两侧再贴快照 → 得
+        // 新鲜非交叉 book。初连时与 symbol_rx broadcast 对同一 symbol 各发一次 SUBSCRIBE,Binance 幂等无害。
+        let registered: Vec<String> = self.symbols.lock().unwrap().iter().cloned().collect();
+        for symbol in registered {
+            let id = generate_rand_string(16);
+            write.send(Message::Text(format!(r#"{{
+                "method": "SUBSCRIBE",
+                "params": [
+                    "{symbol}@trade",
+                    "{symbol}@depth@100ms",
+                    "{symbol}@bookTicker"
+                ],
+                "id": "{id}"
+            }}"#).into())).await?;
+        }
 
         loop {
             select! {
