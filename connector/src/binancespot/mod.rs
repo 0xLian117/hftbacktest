@@ -251,7 +251,10 @@ impl Connector for BinanceSpot {
         let mut symbols = self.symbols.lock().unwrap();
         if !symbols.contains(&symbol) {
             symbols.insert(symbol.clone());
-            self.symbol_tx.send(symbol).unwrap();
+            // QUI-113:广播是「唤醒存活连接立即订阅」的尽力而为;`symbols` 才是权威源(每次(重)连
+            // MarketDataStream/UserDataStream 都从它重放)。重连窗口内无接收者时 `send` 返 Err → **忽略**
+            // (勿 unwrap panic:两流都在换 Receiver 的瞬间 send 会失败,reconnect 会用 set 重放)(Codex P0)。
+            let _ = self.symbol_tx.send(symbol);
         }
     }
 
