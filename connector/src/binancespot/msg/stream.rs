@@ -4,15 +4,18 @@ use serde::{Deserialize, Serialize};
 use super::{from_str_to_side, from_str_to_status, from_str_to_tif, from_str_to_type};
 use crate::utils::{from_str_to_f64, to_lowercase};
 
+// QUI-124：热变体(depthUpdate/aggTrade/trade)借用式零拷贝(px/qty 借进 WS 文本);
+// 冷变体(kline)仍 owned,`'a` 由借用变体使用即满足。镜像 futures EventStream<'a>(add0eef)。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "e")]
-pub enum MarketEventStream {
+pub enum MarketEventStream<'a> {
     #[serde(rename = "depthUpdate")]
-    DepthUpdate(Depth),
+    #[serde(borrow)]
+    DepthUpdate(Depth<'a>),
     #[serde(rename = "aggTrade")]
-    AggTrade(AggTrade),
+    AggTrade(AggTrade<'a>),
     #[serde(rename = "trade")]
-    Trade(Trade),
+    Trade(Trade<'a>),
     #[serde(rename = "kline")]
     Kline(KlineEvent),
 }
@@ -40,29 +43,32 @@ pub struct Result {
 /// （keys 仅 u/s/b/B/a/A，2026-07-15 实测抓帧确认）。故不能进 `#[serde(tag="e")]` 的
 /// `MarketEventStream`（匹配不中被丢），只能进下面 untagged 的 `MarketStream`。
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BookTicker {
+pub struct BookTicker<'a> {
     #[serde(rename = "u")]
     pub update_id: i64,
+    // symbol owned:to_lowercase 必分配 + 跨 publish(1 次/消息)。价/量借用式(Binance 数字串不含转义)。
     #[serde(rename = "s")]
     #[serde(deserialize_with = "to_lowercase")]
     pub symbol: String,
     #[serde(rename = "b")]
-    pub best_bid: String,
+    #[serde(borrow)]
+    pub best_bid: &'a str,
     #[serde(rename = "B")]
-    pub best_bid_qty: String,
+    pub best_bid_qty: &'a str,
     #[serde(rename = "a")]
-    pub best_ask: String,
+    pub best_ask: &'a str,
     #[serde(rename = "A")]
-    pub best_ask_qty: String,
+    pub best_ask_qty: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
-pub enum MarketStream {
-    EventStream(MarketEventStream),
+pub enum MarketStream<'a> {
+    #[serde(borrow)]
+    EventStream(MarketEventStream<'a>),
     // BookTicker 放 Result 前：无 `e` 不误匹配 tagged EventStream；无 `id` 不误匹配 Result；
     // depthUpdate 的 b/a 是数组不误匹配这里的 String 字段。
-    BookTicker(BookTicker),
+    BookTicker(BookTicker<'a>),
     Result(Result),
 }
 
@@ -129,9 +135,10 @@ pub struct SubscribeRequest {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct Depth {
+pub struct Depth<'a> {
     #[serde(rename = "E")]
     pub event_time: i64,
+    // symbol owned:to_lowercase 必分配(1 次/消息,相对 2N+2M 可忽略)。
     #[serde(rename = "s")]
     #[serde(deserialize_with = "to_lowercase")]
     pub symbol: String,
@@ -142,14 +149,16 @@ pub struct Depth {
     pub first_update_id: i64,
     #[serde(rename = "u")]
     pub last_update_id: i64,
+    // 借用式:px/qty 串对借进原 WS 文本(Binance 数字串从不含转义 → 总能借用)。
     #[serde(rename = "b")]
-    pub bids: Vec<(String, String)>,
+    #[serde(borrow)]
+    pub bids: Vec<(&'a str, &'a str)>,
     #[serde(rename = "a")]
-    pub asks: Vec<(String, String)>,
+    pub asks: Vec<(&'a str, &'a str)>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AggTrade {
+pub struct AggTrade<'a> {
     #[serde(rename = "E")]
     pub event_time: i64,
     #[serde(rename = "s")]
@@ -158,9 +167,10 @@ pub struct AggTrade {
     #[serde(rename = "a")]
     pub aggregated_trade_id: i64,
     #[serde(rename = "p")]
-    pub price: String,
+    #[serde(borrow)]
+    pub price: &'a str,
     #[serde(rename = "q")]
-    pub quantity: String,
+    pub quantity: &'a str,
     #[serde(rename = "f")]
     pub first_trade_id: i64,
     #[serde(rename = "l")]
@@ -174,7 +184,7 @@ pub struct AggTrade {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Trade {
+pub struct Trade<'a> {
     #[serde(rename = "E")]
     pub event_time: i64,
     #[serde(rename = "s")]
@@ -183,9 +193,10 @@ pub struct Trade {
     #[serde(rename = "t")]
     pub trade_id: i64,
     #[serde(rename = "p")]
-    pub price: String,
+    #[serde(borrow)]
+    pub price: &'a str,
     #[serde(rename = "q")]
-    pub quantity: String,
+    pub quantity: &'a str,
     #[serde(rename = "T")]
     pub trade_time: i64,
     #[serde(rename = "m")]
@@ -494,6 +505,10 @@ mod tests {
             MarketStream::EventStream(MarketEventStream::DepthUpdate(d)) => {
                 assert_eq!(d.first_update_id, 1);
                 assert_eq!(d.last_update_id, 2);
+                // QUI-124:借用式 &str 档位解析正确(零 String 分配,值不变)。
+                assert_eq!(d.bids, vec![("64845.0", "0.1")]);
+                assert_eq!(d.asks, vec![("64845.01", "0.2")]);
+                assert_eq!(d.symbol, "btcfdusd"); // symbol 仍 owned + to_lowercase
             }
             other => panic!("depthUpdate frame mis-routed: {other:?}"),
         }

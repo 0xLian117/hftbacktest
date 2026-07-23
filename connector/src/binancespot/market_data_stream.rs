@@ -37,9 +37,32 @@ use crate::{
 
 /// 每 symbol 的 L2 depth 同步态（QUI-106，Binance 现货官方 local-order-book 算法）。
 /// 现货 depth diff 有 U(first_update_id)/u(last_update_id)，**无 futures 的 pu** → 用 U/u 连续性。
+/// QUI-124:resync 缓冲的 diff。借用式 `Depth<'a>` 借 WS 帧文本、**不能跨消息存进 `self`**(帧在
+/// process_message 后即 drop),故缓冲态转 owned。除 px/qty 串对外全是 Copy i64 标量 → `.to_string()`
+/// 只发生在 px/qty 上(唯一新增分配点,仅 resync 罕见路径;稳态 Synced 直接借用零分配)。
+struct BufferedDiff {
+    first_update_id: i64,
+    last_update_id: i64,
+    event_time: i64,
+    bids: Vec<(String, String)>,
+    asks: Vec<(String, String)>,
+}
+
+impl BufferedDiff {
+    fn from_depth(d: &stream::Depth<'_>) -> Self {
+        Self {
+            first_update_id: d.first_update_id,
+            last_update_id: d.last_update_id,
+            event_time: d.event_time,
+            bids: d.bids.iter().map(|(p, q)| (p.to_string(), q.to_string())).collect(),
+            asks: d.asks.iter().map(|(p, q)| (p.to_string(), q.to_string())).collect(),
+        }
+    }
+}
+
 enum DepthSync {
-    /// 已请求 REST 快照，其间到达的 diff 先缓冲；快照到达后 drop-stale + align + 回放。
-    AwaitingSnapshot { buffer: Vec<stream::Depth> },
+    /// 已请求 REST 快照，其间到达的 diff 先缓冲(owned)；快照到达后 drop-stale + align + 回放。
+    AwaitingSnapshot { buffer: Vec<BufferedDiff> },
     /// 已对齐；稳态要求下一条 diff 的 U == prev_u + 1，违反则 resync。
     Synced { prev_u: i64 },
 }
@@ -96,11 +119,13 @@ impl MarketDataStream {
     }
 
     /// 发一批 L2 档位事件（BatchStart..BatchEnd）。diff 用 `event_time*1e6`，快照体用 local now（GAP#1）。
-    fn emit_depth(
+    // QUI-124:泛型 S:AsRef<str> —— 稳态传借用 `&str`(零分配胜点)、resync replay 传 owned `String`,
+    // 两路走同一已泛型化的 `parse_depth`。
+    fn emit_depth<S: AsRef<str>>(
         &self,
         symbol: &str,
-        bids: Vec<(String, String)>,
-        asks: Vec<(String, String)>,
+        bids: Vec<(S, S)>,
+        asks: Vec<(S, S)>,
         exch_ts: i64,
     ) {
         match parse_depth(bids, asks) {
@@ -213,26 +238,27 @@ impl MarketDataStream {
         self.ev_tx.send(PublishEvent::BatchEnd(TO_ALL)).unwrap();
     }
 
-    fn process_message(&mut self, stream: MarketEventStream) {
+    fn process_message<'a>(&mut self, stream: MarketEventStream<'a>) {
         match stream {
             MarketEventStream::DepthUpdate(data) => {
                 let sym = data.symbol.clone();
                 // 决策阶段:不跨 self 方法调用持有 depth_sync 的可变借用。
-                // emit=Some(bids,asks,exch_ts) 稳态发档;resync=Some(diff,is_gap) 需(重)取快照。
-                let mut emit: Option<(Vec<(String, String)>, Vec<(String, String)>, i64)> = None;
-                let mut resync: Option<(stream::Depth, bool)> = None;
+                // emit=Some(bids,asks,exch_ts) 稳态发档(**借用式 &str,零分配**);resync=Some(diff,is_gap)
+                // 需(重)取快照——缓冲态转 owned BufferedDiff(不能跨帧存 self)。
+                let mut emit: Option<(Vec<(&'a str, &'a str)>, Vec<(&'a str, &'a str)>, i64)> = None;
+                let mut resync: Option<(BufferedDiff, bool)> = None;
                 match self.depth_sync.get_mut(&sym) {
-                    Some(DepthSync::AwaitingSnapshot { buffer }) => buffer.push(data),
+                    Some(DepthSync::AwaitingSnapshot { buffer }) => buffer.push(BufferedDiff::from_depth(&data)),
                     Some(DepthSync::Synced { prev_u }) => {
                         if data.first_update_id == *prev_u + 1 {
                             *prev_u = data.last_update_id; // 持锁时推进
                             emit = Some((data.bids, data.asks, data.event_time * 1_000_000));
                         } else {
                             warn!(%sym, expected = *prev_u + 1, got = data.first_update_id, "spot depth gap — resync");
-                            resync = Some((data, true));
+                            resync = Some((BufferedDiff::from_depth(&data), true));
                         }
                     }
-                    None => resync = Some((data, false)), // 首个 diff:缓冲 + 取快照(非 gap,不计数)
+                    None => resync = Some((BufferedDiff::from_depth(&data), false)), // 首个 diff:缓冲 + 取快照(非 gap,不计数)
                 }
                 if let Some((bids, asks, exch_ts)) = emit {
                     self.emit_depth(&sym, bids, asks, exch_ts);
