@@ -589,33 +589,41 @@ where
     ) -> Result<ElapseResult, Self::Error> {
         // QUI-81: amend price/qty of a resting order in place (Binance PUT /fapi/v1/order, by
         // origClientOrderId — keeps the client order id, does NOT count toward the 200k cancel/day
-        // limit). Mirrors cancel(): mutate the local order + req=Replaced, then publish LiveRequest::Order;
-        // the connector routes on req==Replaced to rest.modify_order. qty is passed through (price-only
-        // callers must pass the current qty — Binance requires both price and quantity on the amend).
+        // limit). The connector routes on req==Replaced to rest.modify_order. qty is passed through
+        // (price-only callers must pass the current qty — Binance requires both price and quantity on
+        // the amend).
+        //
+        // Unlike cancel() (which only flips the transient `req` marker), a modify changes price/qty —
+        // authoritative fields. We therefore do NOT mutate the stored order optimistically: we send a
+        // *clone* carrying the amended values and leave `instrument.orders[order_id]` at its old
+        // price/qty until the connector reconciles it (update_from_rest on success). A rejected amend
+        // (-5028) publishes only LiveEvent::Error, so the local order correctly stays at the old price
+        // rather than showing a phantom amendment that never took (Codex P1).
         let instrument = self
             .instruments
-            .get_mut(asset_no)
+            .get(asset_no)
             .ok_or(BotError::InstrumentNotFound)?;
         let symbol = instrument.symbol.clone();
         let tick_size = instrument.tick_size;
         let order = instrument
             .orders
-            .get_mut(&order_id)
+            .get(&order_id)
             .ok_or(BotError::OrderNotFound)?;
         if !order.cancellable() {
             return Err(BotError::InvalidOrderStatus);
         }
-        order.price_tick = (price / tick_size).round() as i64;
-        order.qty = qty;
-        order.req = Status::Replaced;
-        order.local_timestamp = Utc::now().timestamp_nanos_opt().unwrap();
+        let mut req_order = order.clone();
+        req_order.price_tick = (price / tick_size).round() as i64;
+        req_order.qty = qty;
+        req_order.req = Status::Replaced;
+        req_order.local_timestamp = Utc::now().timestamp_nanos_opt().unwrap();
 
         self.channel.send(
             self.id,
             asset_no,
             LiveRequest::Order {
                 symbol,
-                order: order.clone(),
+                order: req_order,
             },
         )?;
 
