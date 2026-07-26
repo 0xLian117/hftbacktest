@@ -587,7 +587,43 @@ where
         qty: f64,
         wait: bool,
     ) -> Result<ElapseResult, Self::Error> {
-        todo!();
+        // QUI-81: amend price/qty of a resting order in place (Binance PUT /fapi/v1/order, by
+        // origClientOrderId — keeps the client order id, does NOT count toward the 200k cancel/day
+        // limit). Mirrors cancel(): mutate the local order + req=Replaced, then publish LiveRequest::Order;
+        // the connector routes on req==Replaced to rest.modify_order. qty is passed through (price-only
+        // callers must pass the current qty — Binance requires both price and quantity on the amend).
+        let instrument = self
+            .instruments
+            .get_mut(asset_no)
+            .ok_or(BotError::InstrumentNotFound)?;
+        let symbol = instrument.symbol.clone();
+        let tick_size = instrument.tick_size;
+        let order = instrument
+            .orders
+            .get_mut(&order_id)
+            .ok_or(BotError::OrderNotFound)?;
+        if !order.cancellable() {
+            return Err(BotError::InvalidOrderStatus);
+        }
+        order.price_tick = (price / tick_size).round() as i64;
+        order.qty = qty;
+        order.req = Status::Replaced;
+        order.local_timestamp = Utc::now().timestamp_nanos_opt().unwrap();
+
+        self.channel.send(
+            self.id,
+            asset_no,
+            LiveRequest::Order {
+                symbol,
+                order: order.clone(),
+            },
+        )?;
+
+        if wait {
+            // fixme: timeout should be specified by the argument.
+            return self.wait_order_response(asset_no, order_id, 60_000_000_000);
+        }
+        Ok(ElapseResult::Ok)
     }
 
     #[inline]

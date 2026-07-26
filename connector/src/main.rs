@@ -82,6 +82,11 @@ fn run_receive_task(
                                 // Requests to the Connector cancel the order.
                                 connector.cancel(asset, order, tx.clone());
                             }
+                            Status::Replaced => {
+                                // QUI-81: in-place amend (price/qty) — keeps the client order id,
+                                // not counted against the 200k cancel/day limit.
+                                connector.modify(asset, order, tx.clone());
+                            }
                             status => {
                                 error!(?status, "An invalid request was received from the bot.");
                             }

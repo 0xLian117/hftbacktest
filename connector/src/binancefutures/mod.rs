@@ -367,4 +367,57 @@ impl Connector for BinanceFutures {
             }
         });
     }
+
+    /// QUI-81: amend price/qty of a resting order in place via `PUT /fapi/v1/order` (by
+    /// origClientOrderId — keeps the client order id, does NOT count toward the 200k cancel/day
+    /// limit). Mirrors `cancel` but calls `modify_order`. On error, publish only a `LiveEvent::Error`
+    /// (do NOT mark the order terminal): a rejected amend (-5028) leaves the order still resting at
+    /// the old price, and -2011 (already gone) is reconciled via the user-data stream / next poll.
+    fn modify(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>) {
+        let client = self.client.clone();
+        let order_manager = self.order_manager.clone();
+
+        tokio::spawn(async move {
+            let client_order_id = order_manager
+                .lock()
+                .unwrap()
+                .get_client_order_id(&symbol, order.order_id);
+
+            match client_order_id {
+                Some(client_order_id) => {
+                    let price = order.price_tick as f64 * order.tick_size;
+                    let price_prec = get_precision(order.tick_size);
+                    let result = client
+                        .modify_order(&client_order_id, &symbol, order.side, price, price_prec, order.qty)
+                        .await;
+                    match result {
+                        Ok(resp) => {
+                            if let Some(order) = order_manager
+                                .lock()
+                                .unwrap()
+                                .update_from_rest(&client_order_id, &resp)
+                            {
+                                tx.send(PublishEvent::LiveEvent(LiveEvent::Order { symbol, order }))
+                                    .unwrap();
+                            }
+                        }
+                        Err(error) => {
+                            tx.send(PublishEvent::LiveEvent(LiveEvent::Error(LiveError::with(
+                                ErrorKind::OrderError,
+                                error.into(),
+                            ))))
+                            .unwrap();
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        order_id = order.order_id,
+                        "client_order_id corresponding to order_id is not found for modify; \
+                        the order may already be canceled or filled."
+                    );
+                }
+            }
+        });
+    }
 }

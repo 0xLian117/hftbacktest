@@ -51,6 +51,14 @@ pub trait Connector {
     /// through the channel using [`PublishEvent`]. The returned error should not be related to the
     /// exchange; instead, it should indicate a connector internal error.
     fn cancel(&self, symbol: String, order: Order, tx: UnboundedSender<PublishEvent>);
+
+    /// QUI-81: amends price/qty of an open order in place, preserving the client order id (e.g.
+    /// Binance UM `PUT /fapi/v1/order`, which does not count toward the cancel/day limit). Same
+    /// non-blocking / channel-response contract as submit/cancel. Default = unsupported (venues
+    /// without an in-place amend, e.g. Binance Spot, keep cancel+new).
+    fn modify(&self, _symbol: String, order: Order, _tx: UnboundedSender<PublishEvent>) {
+        tracing::error!(order_id = order.order_id, "modify (in-place amend) is not supported by this connector");
+    }
 }
 
 /// Provides `orders` method to get the current working orders.
