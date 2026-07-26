@@ -593,30 +593,33 @@ where
         // (price-only callers must pass the current qty — Binance requires both price and quantity on
         // the amend).
         //
-        // Unlike cancel() (which only flips the transient `req` marker), a modify changes price/qty —
-        // authoritative fields. We therefore do NOT mutate the stored order optimistically: we send a
-        // *clone* carrying the amended values and leave `instrument.orders[order_id]` at its old
-        // price/qty until the connector reconciles it (update_from_rest on success). A rejected amend
-        // (-5028) publishes only LiveEvent::Error, so the local order correctly stays at the old price
-        // rather than showing a phantom amendment that never took (Codex P1).
+        // Like cancel(), flip the transient `req` marker (+ timestamp) on the stored order so its
+        // in-flight state is visible. But a modify changes price/qty — authoritative fields — so unlike
+        // cancel we do NOT overwrite the stored price/qty here: the amended values ride only on the
+        // *request clone*. The stored order keeps its old price/qty until the connector's Order response
+        // reconciles it (ex_order.update on success). A rejected amend (-5028) publishes only
+        // LiveEvent::Error (no Order event), so the stored order correctly stays at the old price rather
+        // than showing a phantom amendment that never took (Codex P1).
         let instrument = self
             .instruments
-            .get(asset_no)
+            .get_mut(asset_no)
             .ok_or(BotError::InstrumentNotFound)?;
         let symbol = instrument.symbol.clone();
         let tick_size = instrument.tick_size;
         let order = instrument
             .orders
-            .get(&order_id)
+            .get_mut(&order_id)
             .ok_or(BotError::OrderNotFound)?;
         if !order.cancellable() {
             return Err(BotError::InvalidOrderStatus);
         }
+        order.req = Status::Replaced;
+        order.local_timestamp = Utc::now().timestamp_nanos_opt().unwrap();
+        // request clone carries the amended price/qty (the connector reads price_tick/qty off it to
+        // build the PUT); the stored order intentionally does not.
         let mut req_order = order.clone();
         req_order.price_tick = (price / tick_size).round() as i64;
         req_order.qty = qty;
-        req_order.req = Status::Replaced;
-        req_order.local_timestamp = Utc::now().timestamp_nanos_opt().unwrap();
 
         self.channel.send(
             self.id,
