@@ -74,6 +74,10 @@ impl OrderManager {
         if resp.order_filled_accumulated_quantity > order_ext.order.qty - order_ext.order.leaves_qty + 1e-12 {
             order_ext.order.qty = resp.quantity;
             order_ext.order.leaves_qty = resp.quantity - resp.order_filled_accumulated_quantity;
+            // QUI-131(parity): 仅在**累计成交增加**(=这笔事件确有成交)时写 maker。放此块而非上面的 ts 门控块,
+            // 才能覆盖 QUI-114 的迟到 fill(event_time 更旧、走此块、跳过门控);且 NEW/CANCELED 不进此块 →
+            // 不被非成交事件的 `m`(语义未定义)污染。`m`=is_maker(executionReport)。
+            order_ext.order.maker = resp.is_maker;
         }
 
         // QUI-114:即便另一源已把该单标终态(already_removed),若本次**累计成交增加**(cancel 竞态里迟到的
@@ -354,5 +358,56 @@ impl GetOrders for OrderManager {
             .map(|(_, order)| &order.order)
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hftbacktest::types::{OrdType, Order, Side, TimeInForce};
+
+    use super::*;
+
+    // 构造一个 executionReport(直接反序列化到 ExecutionReport;多余字段被忽略)。
+    // 参数化 coid / execution_type(x) / status(X) / last_fill(l) / cum(z) / is_maker(m) / event_time(E)。
+    fn report(coid: &str, x: &str, xs: &str, l: &str, z: &str, m: bool, e: i64) -> ExecutionReport {
+        let json = format!(
+            r#"{{"E":{e},"s":"btcfdusd","c":"{coid}","S":"BUY","o":"LIMIT","f":"GTC",
+            "q":"0.00800000","p":"64685.0","P":"0","F":"0","g":-1,"x":"{x}","X":"{xs}",
+            "r":"NONE","i":1,"l":"{l}","z":"{z}","L":"64685.0","n":"0","T":{e},"t":1,"I":1,
+            "w":false,"m":{m},"M":true,"O":1,"Z":"0","Y":"0","Q":"0","V":"NONE"}}"#
+        );
+        serde_json::from_str(&json).expect("executionReport must decode")
+    }
+
+    fn register(om: &mut OrderManager) -> String {
+        let order = Order::new(1, 646850, 0.1, 0.008, Side::Buy, OrdType::Limit, TimeInForce::GTC);
+        om.prepare_client_order_id("btcfdusd".to_string(), order)
+            .expect("register")
+    }
+
+    #[test]
+    fn maker_set_on_fill_not_on_ack() {
+        let mut om = OrderManager::new("t1s");
+        let coid = register(&mut om);
+        // NEW ack(无成交,z=0)→ 不进 L74 块 → maker 不被写。
+        let acked = om.update_from_ws(&report(&coid, "NEW", "NEW", "0", "0", false, 1000)).unwrap();
+        assert!(!acked.unwrap().maker, "ack 阶段不应写 maker");
+        // TRADE fill(m=true,z 增加)→ L74 fire → maker=true。
+        let filled = om.update_from_ws(&report(&coid, "TRADE", "FILLED", "0.008", "0.008", true, 2000)).unwrap();
+        assert!(filled.unwrap().maker, "fill 后 maker 应为 true");
+    }
+
+    #[test]
+    fn maker_survives_late_out_of_order_fill() {
+        // QUI-114 迟到 fill:event_time 更旧、跳过 L61 ts 门控、只走 L74 累计合并块。
+        // maker 若只写在 L61 块会丢;写在 L74 块才能被这笔迟到 fill 更新。
+        let mut om = OrderManager::new("t1s");
+        let coid = register(&mut om);
+        // 部分成交 A(E=3000, z=0.003, m=false/taker)。
+        let a = om.update_from_ws(&report(&coid, "TRADE", "PARTIALLY_FILLED", "0.003", "0.003", false, 3000)).unwrap();
+        assert!(!a.unwrap().maker);
+        // 迟到最终 fill B(E=2999<3000 → L61 skip;z=0.005>0.003 → L74 fire;m=true)。
+        let b = om.update_from_ws(&report(&coid, "TRADE", "FILLED", "0.002", "0.005", true, 2999)).unwrap();
+        assert!(b.unwrap().maker, "迟到 fill 的 maker 不应丢(必须走 L74 块写)");
     }
 }
